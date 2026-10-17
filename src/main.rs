@@ -1,0 +1,578 @@
+//! Router des Pauvres — serveur.
+//!
+//! Proxy OpenAI-compat sur 127.0.0.1:4445. Chaque POST /v1/chat/completions
+//! est routé vers le CLI officiel `opencode run` (passe la gate fingerprint
+//! Zen) avec cascade de fallback sur les modèles gratuits frontière,
+//! anti-spam par IP, cooldowns d'exhaustion à backoff, cache de
+//! déduplication et endpoint admin.
+use pauvre_router::backend;
+use pauvre_router::cache::Cache;
+use pauvre_router::classify::{self, ErrorKind};
+use pauvre_router::guard::{Gate, RateLimiter};
+use pauvre_router::http::{read_request, write_response, HttpError, Request};
+use pauvre_router::models::{cascade, pick, Health, Registry, FREE_MODELS};
+use pauvre_router::prompt::{compose_prompt, sanitize_model};
+use pauvre_router::stats::{save, Stats};
+use pauvre_router::VERSION;
+
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const PORT: u16 = 4445;
+const MAX_BODY: usize = 1_500_000; // 1.5 Mo
+const RATE_CAPACITY: u32 = 5; // rafale
+const RATE_PER_MIN: f64 = 20.0; // régime permanent
+const GATE_MAX: u32 = 3; // spawns opencode simultanés max
+const GATE_WAIT: Duration = Duration::from_secs(30);
+const CALL_TIMEOUT: Duration = Duration::from_secs(280);
+
+struct Shared {
+    limiter: RateLimiter,
+    gate: Gate,
+    cache: Mutex<Cache>,
+    registry: Mutex<Registry>,
+    stats: Mutex<Stats>,
+    in_flight: AtomicU64,
+    /// (ip, timestamp_epoch) des derniers refus anti-spam, pour /admin/stats.
+    spam_log: Mutex<Vec<(String, u64)>>,
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn err_body(msg: &str, kind: &str, retry_after: Option<u64>) -> serde_json::Value {
+    let mut e = serde_json::json!({
+        "error": {
+            "message": msg,
+            "type": kind,
+        }
+    });
+    if let Some(ra) = retry_after {
+        e["error"]["retry_after"] = serde_json::json!(ra);
+    }
+    e
+}
+
+fn completion_body(text: &str, model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("pauvre-{}", std::process::id()) + "-" + &now_epoch().to_string(),
+        "object": "chat.completion",
+        "created": now_epoch(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": text},
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    })
+}
+
+fn handle_client(stream: TcpStream, shared: &Arc<Shared>) {
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.ip())
+        .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+    let peer_str = peer.to_string();
+    let mut writer = stream.try_clone().expect("try_clone tcp");
+    let mut reader = stream;
+
+    let req = match read_request(&mut reader, &mut writer, MAX_BODY) {
+        Ok(r) => r,
+        Err(HttpError::Closed) => return,
+        Err(HttpError::TooLarge) => {
+            let _ = write_response(
+                &mut writer,
+                413,
+                "Payload Too Large",
+                "application/json",
+                err_body("body trop grand", "invalid_request_error", None)
+                    .to_string()
+                    .as_bytes(),
+                &[],
+            );
+            return;
+        }
+        Err(HttpError::BadRequest(m)) => {
+            let _ = write_response(
+                &mut writer,
+                400,
+                "Bad Request",
+                "application/json",
+                err_body(&m, "invalid_request_error", None)
+                    .to_string()
+                    .as_bytes(),
+                &[],
+            );
+            return;
+        }
+        Err(HttpError::Io(_)) => return,
+    };
+
+    let path = req.path.split('?').next().unwrap_or("").to_string();
+
+    // CORS preflight
+    if req.method == "OPTIONS" {
+        let _ = write_response(&mut writer, 204, "No Content", "text/plain", b"", &[]);
+        return;
+    }
+
+    // ---- endpoints lecture ----
+    if req.method == "GET" && (path == "/health" || path == "/v1/health") {
+        let body = serde_json::json!({
+            "status": "ok",
+            "router": "pauvre-router",
+            "version": VERSION,
+            "in_flight": shared.in_flight.load(Ordering::Relaxed),
+        });
+        let _ = write_response(
+            &mut writer,
+            200,
+            "OK",
+            "application/json",
+            body.to_string().as_bytes(),
+            &[],
+        );
+        return;
+    }
+    if req.method == "GET" && (path == "/v1/models" || path == "/models") {
+        let models: Vec<_> = FREE_MODELS
+            .iter()
+            .map(|m| serde_json::json!({"id": m, "object": "model"}))
+            .collect();
+        let body = serde_json::json!({"object": "list", "data": models});
+        let _ = write_response(
+            &mut writer,
+            200,
+            "OK",
+            "application/json",
+            body.to_string().as_bytes(),
+            &[],
+        );
+        return;
+    }
+    if req.method == "GET" && (path == "/admin/stats" || path == "/admin/health") {
+        let stats = shared.stats.lock().unwrap().clone();
+        let reg = shared.registry.lock().unwrap();
+        let mut health = serde_json::Map::new();
+        let now = Instant::now();
+        for m in FREE_MODELS {
+            let h = reg.get(*m);
+            let (cd, fails, oks, lat) = match h {
+                Some(h) => (
+                    h.cooldown_until
+                        .and_then(|t| t.checked_duration_since(now))
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    h.failures,
+                    h.ok_count,
+                    h.last_latency_ms,
+                ),
+                None => (0, 0, 0, 0),
+            };
+            health.insert(
+                (*m).to_string(),
+                serde_json::json!({
+                    "cooldown_secs": cd,
+                    "failures": fails,
+                    "ok": oks,
+                    "last_latency_ms": lat,
+                }),
+            );
+        }
+        let spam = shared.spam_log.lock().unwrap();
+        let recent_spam: Vec<_> = spam
+            .iter()
+            .rev()
+            .take(20)
+            .map(|(ip, ts)| serde_json::json!({"ip": ip, "at_epoch": ts}))
+            .collect();
+        let body = serde_json::json!({
+            "version": VERSION,
+            "stats": stats,
+            "health": health,
+            "recent_spam": recent_spam,
+            "in_flight": shared.in_flight.load(Ordering::Relaxed),
+        });
+        let _ = write_response(
+            &mut writer,
+            200,
+            "OK",
+            "application/json",
+            body.to_string().as_bytes(),
+            &[],
+        );
+        return;
+    }
+    if req.method == "POST" && (path == "/admin/cache/clear" || path == "/admin/reset") {
+        if let Ok(mut c) = shared.cache.lock() {
+            c.clear();
+        }
+        if let Ok(mut reg) = shared.registry.lock() {
+            reg.clear();
+        }
+        let body = serde_json::json!({"cleared": true});
+        let _ = write_response(
+            &mut writer,
+            200,
+            "OK",
+            "application/json",
+            body.to_string().as_bytes(),
+            &[],
+        );
+        return;
+    }
+
+    // ---- chat ----
+    if req.method == "POST" && (path == "/v1/chat/completions" || path == "/chat/completions") {
+        handle_chat(req, peer, peer_str, shared, writer);
+        return;
+    }
+
+    let _ = write_response(
+        &mut writer,
+        404,
+        "Not Found",
+        "application/json",
+        err_body("endpoint inconnu", "invalid_request_error", None)
+            .to_string()
+            .as_bytes(),
+        &[],
+    );
+}
+
+fn handle_chat(
+    req: Request,
+    peer: std::net::IpAddr,
+    peer_str: String,
+    shared: &Arc<Shared>,
+    mut writer: TcpStream,
+) {
+    // 1) anti-spam
+    let wait = shared.limiter.check(peer).err();
+    if let Some(w) = wait {
+        shared.stats.lock().unwrap().spam_blocked += 1;
+        shared
+            .spam_log
+            .lock()
+            .unwrap()
+            .push((peer_str.clone(), now_epoch()));
+        let body = err_body(
+            &format!("anti-spam: trop de requetes, reessaie dans {w}s"),
+            "rate_limit_error",
+            Some(w),
+        );
+        let _ = write_response(
+            &mut writer,
+            429,
+            "Too Many Requests",
+            "application/json",
+            body.to_string().as_bytes(),
+            &[("Retry-After", &w.to_string())],
+        );
+        return;
+    }
+
+    // 2) parse du body
+    let body: serde_json::Value = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(e) => {
+            let b = err_body(
+                &format!("json invalide: {e}"),
+                "invalid_request_error",
+                None,
+            );
+            let _ = write_response(
+                &mut writer,
+                400,
+                "Bad Request",
+                "application/json",
+                b.to_string().as_bytes(),
+                &[],
+            );
+            return;
+        }
+    };
+    let model_req = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("space-bunny-free")
+        .to_string();
+    if !sanitize_model(&model_req) {
+        let b = err_body("nom de modele invalide", "invalid_request_error", None);
+        let _ = write_response(
+            &mut writer,
+            400,
+            "Bad Request",
+            "application/json",
+            b.to_string().as_bytes(),
+            &[],
+        );
+        return;
+    }
+    let messages = body
+        .get("messages")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let prompt = match compose_prompt(&messages) {
+        Ok(p) => p,
+        Err(e) => {
+            let b = err_body(&e, "invalid_request_error", None);
+            let _ = write_response(
+                &mut writer,
+                400,
+                "Bad Request",
+                "application/json",
+                b.to_string().as_bytes(),
+                &[],
+            );
+            return;
+        }
+    };
+
+    // 3) cache
+    if let Some(text) = shared.cache.lock().unwrap().get(&model_req, &prompt) {
+        shared.stats.lock().unwrap().cache_hits += 1;
+        let b = completion_body(&text, &model_req);
+        let _ = write_response(
+            &mut writer,
+            200,
+            "OK",
+            "application/json",
+            b.to_string().as_bytes(),
+            &[],
+        );
+        return;
+    }
+
+    // 4) slot backend
+    let _guard = match shared.gate.acquire(GATE_WAIT) {
+        Some(g) => g,
+        None => {
+            shared.stats.lock().unwrap().busy_rejected += 1;
+            let b = err_body("serveur occupe, reessaie", "rate_limit_error", Some(5));
+            let _ = write_response(
+                &mut writer,
+                429,
+                "Too Many Requests",
+                "application/json",
+                b.to_string().as_bytes(),
+                &[("Retry-After", "5")],
+            );
+            return;
+        }
+    };
+    shared.in_flight.fetch_add(1, Ordering::Relaxed);
+
+    // 5) cascade
+    let chain = cascade(&model_req);
+    let mut last_err: Option<(serde_json::Value, u16)> = None;
+    for _attempt in 0..chain.len() {
+        let now = Instant::now();
+        let model = {
+            let reg = shared.registry.lock().unwrap();
+            match pick(&chain, &reg, now) {
+                Some(m) => m,
+                None => {
+                    let b = err_body(
+                        "tous les modeles gratuits sont en cooldown, reessaie plus tard",
+                        "rate_limit_error",
+                        Some(30),
+                    );
+                    let _ = write_response(
+                        &mut writer,
+                        429,
+                        "Too Many Requests",
+                        "application/json",
+                        b.to_string().as_bytes(),
+                        &[],
+                    );
+                    shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        };
+        let is_fallback = model != model_req;
+
+        match backend::call(&model, &prompt, CALL_TIMEOUT) {
+            Ok(ok) => {
+                let lat = ok.elapsed;
+                {
+                    let mut reg = shared.registry.lock().unwrap();
+                    reg.entry(model.clone()).or_default().note_success(lat);
+                }
+                {
+                    let mut s = shared.stats.lock().unwrap();
+                    if is_fallback {
+                        s.note_fallback(&model);
+                    } else {
+                        s.note_ok(&model);
+                    }
+                }
+                shared
+                    .cache
+                    .lock()
+                    .unwrap()
+                    .put(&model_req, &prompt, &ok.text);
+                let b = completion_body(&ok.text, &model_req);
+                let _ = write_response(
+                    &mut writer,
+                    200,
+                    "OK",
+                    "application/json",
+                    b.to_string().as_bytes(),
+                    &[],
+                );
+                shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+            Err(be) => {
+                let raw = match &be {
+                    backend::BackendError::Failed { raw, .. } => raw.clone(),
+                    backend::BackendError::Timeout { .. } => "timeout".to_string(),
+                };
+                let kind = classify::classify(&raw);
+                {
+                    let mut reg = shared.registry.lock().unwrap();
+                    let cd = reg
+                        .entry(model.clone())
+                        .or_default()
+                        .note_failure(kind, now);
+                    eprintln!(
+                        "[pauvre-router] model={model} kind={kind:?} cd={}s raw={}",
+                        cd.as_secs(),
+                        raw.chars().take(160).collect::<String>()
+                    );
+                }
+                {
+                    let mut s = shared.stats.lock().unwrap();
+                    s.note_error(&model, kind == ErrorKind::Exhausted);
+                }
+                last_err = Some((
+                    err_body(
+                        &format!("modele {model} indisponible ({kind:?})"),
+                        "upstream_error",
+                        None,
+                    ),
+                    502,
+                ));
+                // continue la cascade
+            }
+        }
+    }
+    shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+    let (b, code) = last_err.unwrap_or_else(|| {
+        (
+            err_body("aucun modele disponible", "upstream_error", None),
+            502,
+        )
+    });
+    let _ = write_response(
+        &mut writer,
+        code,
+        "Bad Gateway",
+        "application/json",
+        b.to_string().as_bytes(),
+        &[],
+    );
+}
+
+fn load_state(shared: &Shared) {
+    let p = pauvre_router::stats::state_path();
+    if let Ok(raw) = std::fs::read_to_string(&p) {
+        if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(s) = doc.get("stats") {
+                if let Ok(parsed) = serde_json::from_value::<Stats>(s.clone()) {
+                    *shared.stats.lock().unwrap() = parsed;
+                }
+            }
+            if let Some(h) = doc.get("health").and_then(|v| v.as_object()) {
+                let mut reg = shared.registry.lock().unwrap();
+                for (k, v) in h {
+                    let failures = v.get("failures").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    let cd_secs = v.get("cooldown_secs").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let cooldown_until =
+                        (cd_secs > 0).then(|| Instant::now() + Duration::from_secs(cd_secs));
+                    let hh = Health {
+                        failures,
+                        cooldown_until,
+                        ..Default::default()
+                    };
+                    reg.insert(k.clone(), hh);
+                }
+            }
+            eprintln!("[pauvre-router] etat restaure depuis {}", p.display());
+        }
+    }
+}
+
+fn periodic_save(shared: Arc<Shared>) {
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
+        let stats = shared.stats.lock().unwrap().clone();
+        let reg = shared.registry.lock().unwrap();
+        let mut health = serde_json::Map::new();
+        let now = Instant::now();
+        for m in FREE_MODELS {
+            let empty = Health::default();
+            let h = reg.get(*m).unwrap_or(&empty);
+            health.insert(
+                (*m).to_string(),
+                serde_json::json!({
+                    "cooldown_secs": h.cooldown_until.and_then(|t| t.checked_duration_since(now)).map(|d| d.as_secs()).unwrap_or(0),
+                    "failures": h.failures,
+                }),
+            );
+        }
+        drop(reg);
+        if let Err(e) = save(&stats, &serde_json::Value::Object(health)) {
+            eprintln!("[pauvre-router] save KO: {e}");
+        }
+    }
+}
+
+fn main() {
+    let shared = Arc::new(Shared {
+        limiter: RateLimiter::new(RATE_CAPACITY, RATE_PER_MIN),
+        gate: Gate::new(GATE_MAX),
+        cache: Mutex::new(Cache::default()),
+        registry: Mutex::new(Registry::new()),
+        stats: Mutex::new(Stats::default()),
+        in_flight: AtomicU64::new(0),
+        spam_log: Mutex::new(Vec::new()),
+    });
+    load_state(&shared);
+
+    let listener = match TcpListener::bind(("127.0.0.1", PORT)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[pauvre-router] bind 127.0.0.1:{PORT} KO: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "[pauvre-router] v{VERSION} sur http://127.0.0.1:{PORT} (cascade: {})",
+        FREE_MODELS.join(" -> ")
+    );
+
+    {
+        let s = shared.clone();
+        std::thread::spawn(move || periodic_save(s));
+    }
+
+    for conn in listener.incoming() {
+        match conn {
+            Ok(stream) => {
+                let s = shared.clone();
+                std::thread::spawn(move || handle_client(stream, &s));
+            }
+            Err(e) => eprintln!("[pauvre-router] accept KO: {e}"),
+        }
+    }
+}

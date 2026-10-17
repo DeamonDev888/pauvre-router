@@ -1,0 +1,7 @@
+{
+  "id": "pauvre-router",
+  "name": "Router des Pauvres",
+  "version": "0.1.0",
+  "description": "Monitoring du router des pauvres : santé des modèles gratuits Zen, cooldowns, stats, spam.",
+  "entry": "plugin.js"
+}
