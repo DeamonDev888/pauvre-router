@@ -16,6 +16,7 @@ pub mod http;
 pub mod keystore;
 pub mod models;
 pub mod prompt;
+pub mod server;
 pub mod stats;
 
 /// Version du crate (affichée dans /health et /admin/stats).

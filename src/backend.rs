@@ -45,8 +45,24 @@ pub fn call(
     timeout: Duration,
     api_key: Option<&str>,
 ) -> Result<BackendOk, BackendError> {
-    let exe = opencode_path();
-    let mut cmd = Command::new(&exe);
+    call_at(&opencode_path(), model, prompt, timeout, api_key, &[])
+}
+
+/// Comme [`call`] mais avec un exe imposé (tests E2E : binaire stub).
+/// `extra_env` : variables additionnelles posées sur le spawn (le stub
+/// de test lit `STUB_FAIL` ; la prod n'en passe aucune).
+pub fn call_at(
+    exe: &str,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+    api_key: Option<&str>,
+    extra_env: &[(String, String)],
+) -> Result<BackendOk, BackendError> {
+    let mut cmd = Command::new(exe);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     cmd.args(["run", "--model", &format!("opencode/{model}")])
         .env("USERPROFILE", "C:\\Users\\Deamon")
         .env("HOMEDRIVE", "C:")

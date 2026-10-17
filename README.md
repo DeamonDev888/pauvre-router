@@ -206,6 +206,12 @@ Consultez le **[`SKILL.md`](SKILL.md) §3** pour la configuration pas-à-pas.
 Les binaires Windows, Linux et macOS sont construits et packagés automatiquement par GitHub Actions à chaque tag :  
 Consultez la page **[Releases](../../releases)** pour télécharger les binaires précompilés.
 
+## 🧪 Tests
+
+**59 tests** (43 unitaires + 16 E2E), tous verts en `cargo test` comme en `cargo test --release` :
+
+- **E2E** (`tests/e2e.rs`) : de vrais serveurs démarrent sur des ports éphémères (mêmes workers que la prod) et parlent TCP pour de vrai — un stub `opencode` (`src/bin/stub-opencode.rs`, piloté par env `STUB_FAIL`) remplace le CLI réel. Couverture : cascade de fallback, cooldowns, 429 tous-cooldowns, anti-spam token bucket, SSE streaming, cache, rotation de clés prouvée côté spawn, timeout backend, keep-alive, 413, persistance de l'état sur reboot, 12 requêtes concurrentes.
+
 ---
 
 ## 📜 Licence

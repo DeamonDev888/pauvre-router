@@ -56,9 +56,17 @@ pub fn state_path() -> PathBuf {
         })
 }
 
-/// Sauvegarde atomique (tmp + rename).
+/// Sauvegarde atomique (tmp + rename) vers le chemin d'état par défaut.
 pub fn save(stats: &Stats, registry_dump: &serde_json::Value) -> std::io::Result<()> {
-    let p = state_path();
+    save_to(&state_path(), stats, registry_dump)
+}
+
+/// Sauvegarde atomique (tmp + rename) vers un chemin imposé (tests E2E).
+pub fn save_to(
+    p: &std::path::Path,
+    stats: &Stats,
+    registry_dump: &serde_json::Value,
+) -> std::io::Result<()> {
     let doc = serde_json::json!({
         "saved_at_epoch": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         "stats": stats,
@@ -66,7 +74,7 @@ pub fn save(stats: &Stats, registry_dump: &serde_json::Value) -> std::io::Result
     });
     let tmp = p.with_extension("tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(&doc).unwrap())?;
-    std::fs::rename(&tmp, &p)
+    std::fs::rename(&tmp, p)
 }
 
 #[cfg(test)]
