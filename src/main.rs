@@ -1,15 +1,18 @@
 //! Router des Pauvres — serveur.
 //!
-//! Proxy OpenAI-compat sur 127.0.0.1:4445. Chaque POST /v1/chat/completions
-//! est routé vers le CLI officiel `opencode run` (passe la gate fingerprint
-//! Zen) avec cascade de fallback sur les modèles gratuits frontière,
-//! anti-spam par IP, cooldowns d'exhaustion à backoff, cache de
-//! déduplication et endpoint admin.
+//! Boucle à workers FIXES : chaque worker prend une connexion de la file
+//! d'attente et la sert JUSQU'À SA MORT (keep-alive, timeouts lecture/
+//! écriture, deadline totale). Un client qui disparaît est récolté par
+//! son worker — aucun thread par requête, aucun zombie possible.
+//!
+//! POST /v1/chat/completions → spawn de `opencode run` (le client
+//! officiel passe la gate fingerprint Zen) avec cascade de fallback,
+//! pool de clés API en rotation, anti-spam, cache et cooldowns.
 use pauvre_router::backend;
 use pauvre_router::cache::Cache;
 use pauvre_router::classify::{self, ErrorKind};
 use pauvre_router::guard::{Gate, RateLimiter};
-use pauvre_router::http::{read_request, write_response, HttpError, Request};
+use pauvre_router::http::{HttpConn, HttpError, Request, MAX_CONN_AGE};
 use pauvre_router::keystore::{KeyChoice, KeyStore};
 use pauvre_router::models::{
     cascade, pick, pick_round_robin, Health, Registry, FREE_MODELS, ROBIN_MODEL,
@@ -18,9 +21,10 @@ use pauvre_router::prompt::{compose_prompt, sanitize_model};
 use pauvre_router::stats::{save, Stats};
 use pauvre_router::VERSION;
 
+use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const PORT: u16 = 4445;
@@ -29,8 +33,10 @@ const RATE_CAPACITY: u32 = 5; // rafale
 const RATE_PER_MIN: f64 = 20.0; // régime permanent
 const GATE_MAX: u32 = 3; // spawns opencode simultanés max
 const GATE_WAIT: Duration = Duration::from_secs(30);
-const CALL_TIMEOUT: Duration = Duration::from_secs(280);
-const KEY_BACKOFF: u64 = 1800; // cooldown clé après échec (30 min, ×2 par récidive via max)
+const CALL_TIMEOUT: Duration = Duration::from_secs(80); // par modèle — un client ne doit jamais attendre des plafonds
+const KEY_BACKOFF: u64 = 1800; // cooldown clé après échec (30 min)
+const N_WORKERS: usize = 8; // workers fixes — LA réponse anti-zombie
+const QUEUE_CAP: usize = 64; // file de connexions en attente
 
 struct Shared {
     limiter: RateLimiter,
@@ -39,15 +45,48 @@ struct Shared {
     registry: Mutex<Registry>,
     stats: Mutex<Stats>,
     in_flight: AtomicU64,
-    /// (ip, timestamp_epoch) des derniers refus anti-spam, pour /admin/stats.
     spam_log: Mutex<Vec<(String, u64)>>,
-    /// Pool de clés API Zen (rotation anti-quota).
     keystore: Mutex<KeyStore>,
-    /// Mode de routage : "priority" (exhaust le 1er avant de changer)
-    /// ou "roundrobin" (répartit à chaque requête). PAUVRE_MODE.
+    /// Mode de routage : "priority" | "roundrobin".
     mode: Mutex<String>,
-    /// Curseur round-robin partagé.
     rr_cursor: Mutex<usize>,
+}
+
+/// File de connexions bornée (producteur = accept, consommateurs = workers).
+struct Queue {
+    inner: Mutex<VecDeque<TcpStream>>,
+    cv: Condvar,
+}
+
+impl Queue {
+    fn new(cap: usize) -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::with_capacity(cap)),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Bloque jusqu'à une connexion disponible.
+    fn pop(&self) -> TcpStream {
+        let mut q = self.inner.lock().unwrap();
+        loop {
+            if let Some(s) = q.pop_front() {
+                return s;
+            }
+            q = self.cv.wait(q).unwrap();
+        }
+    }
+
+    fn push(&self, s: TcpStream) -> bool {
+        let mut q = self.inner.lock().unwrap();
+        if q.len() >= QUEUE_CAP {
+            return false; // saturation : on referme (backpressure)
+        }
+        q.push_back(s);
+        drop(q);
+        self.cv.notify_one();
+        true
+    }
 }
 
 fn now_epoch() -> u64 {
@@ -59,10 +98,7 @@ fn now_epoch() -> u64 {
 
 fn err_body(msg: &str, kind: &str, retry_after: Option<u64>) -> serde_json::Value {
     let mut e = serde_json::json!({
-        "error": {
-            "message": msg,
-            "type": kind,
-        }
+        "error": {"message": msg, "type": kind}
     });
     if let Some(ra) = retry_after {
         e["error"]["retry_after"] = serde_json::json!(ra);
@@ -72,7 +108,7 @@ fn err_body(msg: &str, kind: &str, retry_after: Option<u64>) -> serde_json::Valu
 
 fn completion_body(text: &str, model: &str) -> serde_json::Value {
     serde_json::json!({
-        "id": format!("pauvre-{}", std::process::id()) + "-" + &now_epoch().to_string(),
+        "id": format!("pauvre-{}-{}", std::process::id(), now_epoch()),
         "object": "chat.completion",
         "created": now_epoch(),
         "model": model,
@@ -85,52 +121,69 @@ fn completion_body(text: &str, model: &str) -> serde_json::Value {
     })
 }
 
-fn handle_client(stream: TcpStream, shared: &Arc<Shared>) {
-    let peer = stream
-        .peer_addr()
-        .map(|a| a.ip())
-        .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+/// Sert UNE connexion entière (1..n requêtes en keep-alive) sous deadline.
+fn serve_conn(stream: TcpStream, peer: std::net::IpAddr, shared: &Arc<Shared>) {
     let peer_str = peer.to_string();
-    let mut writer = stream.try_clone().expect("try_clone tcp");
-    let mut reader = stream;
-
-    let req = match read_request(&mut reader, &mut writer, MAX_BODY) {
-        Ok(r) => r,
-        Err(HttpError::Closed) => return,
-        Err(HttpError::TooLarge) => {
-            let _ = write_response(
-                &mut writer,
-                413,
-                "Payload Too Large",
-                "application/json",
-                err_body("body trop grand", "invalid_request_error", None)
-                    .to_string()
-                    .as_bytes(),
-                &[],
-            );
-            return;
-        }
-        Err(HttpError::BadRequest(m)) => {
-            let _ = write_response(
-                &mut writer,
-                400,
-                "Bad Request",
-                "application/json",
-                err_body(&m, "invalid_request_error", None)
-                    .to_string()
-                    .as_bytes(),
-                &[],
-            );
-            return;
-        }
-        Err(HttpError::Io(_)) => return,
+    let mut conn = match HttpConn::new(stream) {
+        Ok(c) => c,
+        Err(_) => return,
     };
+    let deadline = Instant::now() + MAX_CONN_AGE;
+    loop {
+        let idle_left = deadline.saturating_duration_since(Instant::now());
+        if idle_left.is_zero() {
+            return; // connexion trop vieille : fermée proprement
+        }
+        let req = match conn.read_request(MAX_BODY, idle_left) {
+            Ok(r) => r,
+            Err(HttpError::Closed) | Err(HttpError::ConnExpired) => return,
+            Err(HttpError::TooLarge) => {
+                let b = err_body("body trop grand", "invalid_request_error", None);
+                let _ = conn.write_response(
+                    413,
+                    "Payload Too Large",
+                    "application/json",
+                    b.to_string().as_bytes(),
+                    &[],
+                    false,
+                );
+                return;
+            }
+            Err(HttpError::BadRequest(m)) => {
+                let b = err_body(&m, "invalid_request_error", None);
+                let _ = conn.write_response(
+                    400,
+                    "Bad Request",
+                    "application/json",
+                    b.to_string().as_bytes(),
+                    &[],
+                    false,
+                );
+                return;
+            }
+            Err(HttpError::Io(_)) => return,
+        };
+        let keep = req.keep_alive && Instant::now() < deadline;
+        route_request(&mut conn, req, peer, &peer_str, shared, keep);
+        if !keep {
+            return;
+        }
+    }
+}
 
+/// Route une requête unique. `keep` est répercuté sur la réponse.
+fn route_request(
+    conn: &mut HttpConn,
+    req: Request,
+    peer: std::net::IpAddr,
+    peer_str: &str,
+    shared: &Arc<Shared>,
+    keep: bool,
+) {
     let path = req.path.split('?').next().unwrap_or("").to_string();
 
-    // CORS preflight
     if req.method == "OPTIONS" {
-        let _ = write_response(&mut writer, 204, "No Content", "text/plain", b"", &[]);
+        let _ = conn.write_response(204, "No Content", "text/plain", b"", &[], keep);
         return;
     }
 
@@ -140,20 +193,21 @@ fn handle_client(stream: TcpStream, shared: &Arc<Shared>) {
             "status": "ok",
             "router": "pauvre-router",
             "version": VERSION,
+            "mode": shared.mode.lock().unwrap().clone(),
             "in_flight": shared.in_flight.load(Ordering::Relaxed),
         });
-        let _ = write_response(
-            &mut writer,
+        let _ = conn.write_response(
             200,
             "OK",
             "application/json",
             body.to_string().as_bytes(),
             &[],
+            keep,
         );
         return;
     }
     if req.method == "GET" && (path == "/v1/models" || path == "/models") {
-        let mut models: Vec<_> = vec![serde_json::json!({
+        let mut models = vec![serde_json::json!({
             "id": ROBIN_MODEL,
             "object": "model",
             "description": "round-robin permanent sur les modeles frontieres",
@@ -164,72 +218,18 @@ fn handle_client(stream: TcpStream, shared: &Arc<Shared>) {
                 .map(|m| serde_json::json!({"id": m, "object": "model"})),
         );
         let body = serde_json::json!({"object": "list", "data": models});
-        let _ = write_response(
-            &mut writer,
+        let _ = conn.write_response(
             200,
             "OK",
             "application/json",
             body.to_string().as_bytes(),
             &[],
+            keep,
         );
         return;
     }
     if req.method == "GET" && (path == "/admin/stats" || path == "/admin/health") {
-        let stats = shared.stats.lock().unwrap().clone();
-        let reg = shared.registry.lock().unwrap();
-        let mut health = serde_json::Map::new();
-        let now = Instant::now();
-        for m in FREE_MODELS {
-            let h = reg.get(*m);
-            let (cd, fails, oks, lat) = match h {
-                Some(h) => (
-                    h.cooldown_until
-                        .and_then(|t| t.checked_duration_since(now))
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                    h.failures,
-                    h.ok_count,
-                    h.last_latency_ms,
-                ),
-                None => (0, 0, 0, 0),
-            };
-            health.insert(
-                (*m).to_string(),
-                serde_json::json!({
-                    "cooldown_secs": cd,
-                    "failures": fails,
-                    "ok": oks,
-                    "last_latency_ms": lat,
-                }),
-            );
-        }
-        let spam = shared.spam_log.lock().unwrap();
-        let recent_spam: Vec<_> = spam
-            .iter()
-            .rev()
-            .take(20)
-            .map(|(ip, ts)| serde_json::json!({"ip": ip, "at_epoch": ts}))
-            .collect();
-        drop(spam);
-        let keys_meta = shared.keystore.lock().unwrap().meta();
-        let mode = shared.mode.lock().unwrap().clone();
-        let body = serde_json::json!({
-            "version": VERSION,
-            "stats": stats,
-            "health": health,
-            "recent_spam": recent_spam,
-            "keys": keys_meta,
-            "mode": mode,
-            "in_flight": shared.in_flight.load(Ordering::Relaxed),
-        });
-        let _ = write_response(
-            &mut writer,
-            200,
-            "OK",
-            "application/json",
-            body.to_string().as_bytes(),
-            &[],
-        );
+        admin_stats(conn, shared, keep);
         return;
     }
     if req.method == "POST" && (path == "/admin/cache/clear" || path == "/admin/reset") {
@@ -240,30 +240,28 @@ fn handle_client(stream: TcpStream, shared: &Arc<Shared>) {
             reg.clear();
         }
         let body = serde_json::json!({"cleared": true});
-        let _ = write_response(
-            &mut writer,
+        let _ = conn.write_response(
             200,
             "OK",
             "application/json",
             body.to_string().as_bytes(),
             &[],
+            keep,
         );
         return;
     }
 
-    // ---- mode de routage (priority | roundrobin) ----
-    // GET  /admin/mode          : mode courant
-    // POST /admin/mode          : {"mode": "priority"|"roundrobin"}
+    // ---- mode de routage ----
     if req.method == "GET" && path == "/admin/mode" {
         let m = shared.mode.lock().unwrap().clone();
         let body = serde_json::json!({"mode": m});
-        let _ = write_response(
-            &mut writer,
+        let _ = conn.write_response(
             200,
             "OK",
             "application/json",
             body.to_string().as_bytes(),
             &[],
+            keep,
         );
         return;
     }
@@ -274,13 +272,13 @@ fn handle_client(stream: TcpStream, shared: &Arc<Shared>) {
         if wanted == "priority" || wanted == "roundrobin" {
             *shared.mode.lock().unwrap() = wanted.to_string();
             let body = serde_json::json!({"mode": wanted, "applied": true});
-            let _ = write_response(
-                &mut writer,
+            let _ = conn.write_response(
                 200,
                 "OK",
                 "application/json",
                 body.to_string().as_bytes(),
                 &[],
+                keep,
             );
         } else {
             let b = err_body(
@@ -288,168 +286,217 @@ fn handle_client(stream: TcpStream, shared: &Arc<Shared>) {
                 "invalid_request_error",
                 None,
             );
-            let _ = write_response(
-                &mut writer,
+            let _ = conn.write_response(
                 400,
                 "Bad Request",
                 "application/json",
                 b.to_string().as_bytes(),
                 &[],
+                keep,
             );
         }
         return;
     }
 
-    // ---- gestion du pool de clés API (rotation anti-quota) ----
-    // GET  /admin/keys            : méta (jamais les valeurs)
-    // POST /admin/keys/add        : {"key": "sk-..."}          → ajoute
-    // POST /admin/keys/remove     : {"key": "sk-..."}          → retire
-    // POST /admin/keys/reanimate  : {"key": "sk-..."} ou {}    → réactive
+    // ---- pool de clés API ----
     if req.method == "GET" && path == "/admin/keys" {
-        let ks = shared.keystore.lock().unwrap();
-        let body = ks.meta();
-        drop(ks);
-        let _ = write_response(
-            &mut writer,
+        let body = shared.keystore.lock().unwrap().meta();
+        let _ = conn.write_response(
             200,
             "OK",
             "application/json",
             body.to_string().as_bytes(),
             &[],
+            keep,
         );
         return;
     }
     if req.method == "POST" && path.starts_with("/admin/keys/") {
-        let action = path.trim_start_matches("/admin/keys/");
-        let body: serde_json::Value = match serde_json::from_slice(&req.body) {
-            Ok(b) => b,
-            Err(_) => serde_json::json!({}),
-        };
-        let key = body
-            .get("key")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let (code, body) = {
-            let mut ks = shared.keystore.lock().unwrap();
-            match action {
-                "add" => {
-                    if key.is_empty() {
-                        (
-                            400,
-                            err_body("champ 'key' requis", "invalid_request_error", None),
-                        )
-                    } else if ks.add(&key) {
-                        let _ = ks.save();
-                        (200, serde_json::json!({"added": true, "total": ks.count()}))
-                    } else {
-                        (
-                            400,
-                            err_body(
-                                "cle refusee (doublon ou format invalide: prefixe sk-/zen-, 20-200 chars)",
-                                "invalid_request_error",
-                                None,
-                            ),
-                        )
-                    }
-                }
-                "remove" => {
-                    if ks.remove(&key) {
-                        let _ = ks.save();
-                        (
-                            200,
-                            serde_json::json!({"removed": true, "total": ks.count()}),
-                        )
-                    } else {
-                        (404, err_body("cle inconnue", "invalid_request_error", None))
-                    }
-                }
-                "reanimate" => {
-                    if key.is_empty() {
-                        // toutes : purge complète des marqueurs
-                        let n = ks.count();
-                        ks.reanimate_all();
-                        let _ = ks.save();
-                        (200, serde_json::json!({"reanimated": n}))
-                    } else {
-                        ks.note_success(&key);
-                        let _ = ks.save();
-                        (200, serde_json::json!({"reanimated": 1}))
-                    }
-                }
-                _ => (
-                    404,
-                    err_body(
-                        "action inconnue (add|remove|reanimate)",
-                        "invalid_request_error",
-                        None,
-                    ),
-                ),
-            }
-        };
-        let reason = if code == 200 { "OK" } else { "Bad Request" };
-        let _ = write_response(
-            &mut writer,
-            code,
-            reason,
-            "application/json",
-            body.to_string().as_bytes(),
-            &[],
-        );
+        admin_keys(conn, req, &path, shared, keep);
         return;
     }
 
     // ---- chat ----
     if req.method == "POST" && (path == "/v1/chat/completions" || path == "/chat/completions") {
-        handle_chat(req, peer, peer_str, shared, writer);
+        handle_chat(req, peer, peer_str, shared, conn, keep);
         return;
     }
 
-    let _ = write_response(
-        &mut writer,
+    let b = err_body("endpoint inconnu", "invalid_request_error", None);
+    let _ = conn.write_response(
         404,
         "Not Found",
         "application/json",
-        err_body("endpoint inconnu", "invalid_request_error", None)
-            .to_string()
-            .as_bytes(),
+        b.to_string().as_bytes(),
         &[],
+        keep,
     );
 }
 
+fn admin_stats(conn: &mut HttpConn, shared: &Arc<Shared>, keep: bool) {
+    let stats = shared.stats.lock().unwrap().clone();
+    let reg = shared.registry.lock().unwrap();
+    let mut health = serde_json::Map::new();
+    let now = Instant::now();
+    for m in FREE_MODELS {
+        let h = reg.get(*m);
+        let (cd, fails, oks, lat) = match h {
+            Some(h) => (
+                h.cooldown_until
+                    .and_then(|t| t.checked_duration_since(now))
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                h.failures,
+                h.ok_count,
+                h.last_latency_ms,
+            ),
+            None => (0, 0, 0, 0),
+        };
+        health.insert(
+            (*m).to_string(),
+            serde_json::json!({"cooldown_secs": cd, "failures": fails, "ok": oks, "last_latency_ms": lat}),
+        );
+    }
+    drop(reg);
+    let spam = shared.spam_log.lock().unwrap();
+    let recent_spam: Vec<_> = spam
+        .iter()
+        .rev()
+        .take(20)
+        .map(|(ip, ts)| serde_json::json!({"ip": ip, "at_epoch": ts}))
+        .collect();
+    drop(spam);
+    let keys_meta = shared.keystore.lock().unwrap().meta();
+    let mode = shared.mode.lock().unwrap().clone();
+    let body = serde_json::json!({
+        "version": VERSION,
+        "stats": stats,
+        "health": health,
+        "recent_spam": recent_spam,
+        "keys": keys_meta,
+        "mode": mode,
+        "in_flight": shared.in_flight.load(Ordering::Relaxed),
+    });
+    let _ = conn.write_response(
+        200,
+        "OK",
+        "application/json",
+        body.to_string().as_bytes(),
+        &[],
+        keep,
+    );
+}
+
+fn admin_keys(conn: &mut HttpConn, req: Request, path: &str, shared: &Arc<Shared>, keep: bool) {
+    let action = path.trim_start_matches("/admin/keys/");
+    let body: serde_json::Value =
+        serde_json::from_slice(&req.body).unwrap_or(serde_json::json!({}));
+    let key = body
+        .get("key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let (code, body) = {
+        let mut ks = shared.keystore.lock().unwrap();
+        match action {
+            "add" => {
+                if key.is_empty() {
+                    (
+                        400,
+                        err_body("champ 'key' requis", "invalid_request_error", None),
+                    )
+                } else if ks.add(&key) {
+                    let _ = ks.save();
+                    (200, serde_json::json!({"added": true, "total": ks.count()}))
+                } else {
+                    (
+                        400,
+                        err_body(
+                            "cle refusee (doublon ou format invalide: prefixe sk-/zen-, 20-200 chars)",
+                            "invalid_request_error",
+                            None,
+                        ),
+                    )
+                }
+            }
+            "remove" => {
+                if ks.remove(&key) {
+                    let _ = ks.save();
+                    (
+                        200,
+                        serde_json::json!({"removed": true, "total": ks.count()}),
+                    )
+                } else {
+                    (404, err_body("cle inconnue", "invalid_request_error", None))
+                }
+            }
+            "reanimate" => {
+                if key.is_empty() {
+                    let n = ks.count();
+                    ks.reanimate_all();
+                    let _ = ks.save();
+                    (200, serde_json::json!({"reanimated": n}))
+                } else {
+                    ks.note_success(&key);
+                    let _ = ks.save();
+                    (200, serde_json::json!({"reanimated": 1}))
+                }
+            }
+            _ => (
+                404,
+                err_body(
+                    "action inconnue (add|remove|reanimate)",
+                    "invalid_request_error",
+                    None,
+                ),
+            ),
+        }
+    };
+    let reason = if code == 200 { "OK" } else { "Bad Request" };
+    let _ = conn.write_response(
+        code,
+        reason,
+        "application/json",
+        body.to_string().as_bytes(),
+        &[],
+        keep,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_chat(
     req: Request,
     peer: std::net::IpAddr,
-    peer_str: String,
+    peer_str: &str,
     shared: &Arc<Shared>,
-    mut writer: TcpStream,
+    conn: &mut HttpConn,
+    keep: bool,
 ) {
     // 1) anti-spam
-    let wait = shared.limiter.check(peer).err();
-    if let Some(w) = wait {
+    if let Some(w) = shared.limiter.check(peer).err() {
         shared.stats.lock().unwrap().spam_blocked += 1;
         shared
             .spam_log
             .lock()
             .unwrap()
-            .push((peer_str.clone(), now_epoch()));
+            .push((peer_str.to_string(), now_epoch()));
         let body = err_body(
             &format!("anti-spam: trop de requetes, reessaie dans {w}s"),
             "rate_limit_error",
             Some(w),
         );
-        let _ = write_response(
-            &mut writer,
+        let _ = conn.write_response(
             429,
             "Too Many Requests",
             "application/json",
             body.to_string().as_bytes(),
             &[("Retry-After", &w.to_string())],
+            keep,
         );
         return;
     }
 
-    // 2) parse du body
+    // 2) parse
     let body: serde_json::Value = match serde_json::from_slice(&req.body) {
         Ok(b) => b,
         Err(e) => {
@@ -458,13 +505,13 @@ fn handle_chat(
                 "invalid_request_error",
                 None,
             );
-            let _ = write_response(
-                &mut writer,
+            let _ = conn.write_response(
                 400,
                 "Bad Request",
                 "application/json",
                 b.to_string().as_bytes(),
                 &[],
+                keep,
             );
             return;
         }
@@ -472,17 +519,17 @@ fn handle_chat(
     let model_req = body
         .get("model")
         .and_then(|v| v.as_str())
-        .unwrap_or("space-bunny-free")
+        .unwrap_or("glm-5.3-flash-free")
         .to_string();
     if !sanitize_model(&model_req) {
         let b = err_body("nom de modele invalide", "invalid_request_error", None);
-        let _ = write_response(
-            &mut writer,
+        let _ = conn.write_response(
             400,
             "Bad Request",
             "application/json",
             b.to_string().as_bytes(),
             &[],
+            keep,
         );
         return;
     }
@@ -494,13 +541,13 @@ fn handle_chat(
         Ok(p) => p,
         Err(e) => {
             let b = err_body(&e, "invalid_request_error", None);
-            let _ = write_response(
-                &mut writer,
+            let _ = conn.write_response(
                 400,
                 "Bad Request",
                 "application/json",
                 b.to_string().as_bytes(),
                 &[],
+                keep,
             );
             return;
         }
@@ -510,13 +557,13 @@ fn handle_chat(
     if let Some(text) = shared.cache.lock().unwrap().get(&model_req, &prompt) {
         shared.stats.lock().unwrap().cache_hits += 1;
         let b = completion_body(&text, &model_req);
-        let _ = write_response(
-            &mut writer,
+        let _ = conn.write_response(
             200,
             "OK",
             "application/json",
             b.to_string().as_bytes(),
             &[],
+            keep,
         );
         return;
     }
@@ -527,50 +574,48 @@ fn handle_chat(
         None => {
             shared.stats.lock().unwrap().busy_rejected += 1;
             let b = err_body("serveur occupe, reessaie", "rate_limit_error", Some(5));
-            let _ = write_response(
-                &mut writer,
+            let _ = conn.write_response(
                 429,
                 "Too Many Requests",
                 "application/json",
                 b.to_string().as_bytes(),
                 &[("Retry-After", "5")],
+                keep,
             );
             return;
         }
     };
     shared.in_flight.fetch_add(1, Ordering::Relaxed);
 
-    // 5) cascade
+    // 5) cascade (robin = toute la chaîne frontière)
     let chain = cascade(&model_req);
     let mut last_err: Option<(serde_json::Value, u16)> = None;
     for _attempt in 0..chain.len() {
         let now = Instant::now();
-        // choix du modèle selon le mode de routage
         let model = {
             let reg = shared.registry.lock().unwrap();
             let mode = shared.mode.lock().unwrap().clone();
-            let picked = if mode == "roundrobin" {
+            let picked = if model_req == ROBIN_MODEL || mode == "roundrobin" {
                 let mut cur = shared.rr_cursor.lock().unwrap();
                 pick_round_robin(&chain, &reg, &mut cur, now)
             } else {
-                // priority : exhaust le premier dispo (cooldown = exhaustion) avant de passer au suivant
                 pick(&chain, &reg, now)
             };
             match picked {
                 Some(m) => m,
                 None => {
                     let b = err_body(
-                        "tous les modeles gratuits sont en cooldown, reessaie plus tard",
+                        "tous les modeles frontieres sont en cooldown, reessaie plus tard",
                         "rate_limit_error",
                         Some(30),
                     );
-                    let _ = write_response(
-                        &mut writer,
+                    let _ = conn.write_response(
                         429,
                         "Too Many Requests",
                         "application/json",
                         b.to_string().as_bytes(),
                         &[],
+                        keep,
                     );
                     shared.in_flight.fetch_sub(1, Ordering::Relaxed);
                     return;
@@ -583,7 +628,7 @@ fn handle_chat(
             KeyChoice::Use(k) => Some(k.as_str()),
             KeyChoice::Anonymous => None,
         };
-        let is_fallback = model != model_req;
+        let is_fallback = model != model_req && model_req != ROBIN_MODEL;
 
         match backend::call(&model, &prompt, CALL_TIMEOUT, api_key) {
             Ok(ok) => {
@@ -609,13 +654,13 @@ fn handle_chat(
                     .unwrap()
                     .put(&model_req, &prompt, &ok.text);
                 let b = completion_body(&ok.text, &model_req);
-                let _ = write_response(
-                    &mut writer,
+                let _ = conn.write_response(
                     200,
                     "OK",
                     "application/json",
                     b.to_string().as_bytes(),
                     &[],
+                    keep,
                 );
                 shared.in_flight.fetch_sub(1, Ordering::Relaxed);
                 return;
@@ -659,7 +704,6 @@ fn handle_chat(
                     ),
                     502,
                 ));
-                // continue la cascade
             }
         }
     }
@@ -670,13 +714,13 @@ fn handle_chat(
             502,
         )
     });
-    let _ = write_response(
-        &mut writer,
+    let _ = conn.write_response(
         code,
         "Bad Gateway",
         "application/json",
         b.to_string().as_bytes(),
         &[],
+        keep,
     );
 }
 
@@ -713,35 +757,33 @@ fn periodic_save(shared: Arc<Shared>) {
     loop {
         std::thread::sleep(Duration::from_secs(60));
         let stats = shared.stats.lock().unwrap().clone();
-        let reg = shared.registry.lock().unwrap();
-        let mut health = serde_json::Map::new();
-        let now = Instant::now();
-        for m in FREE_MODELS {
-            let empty = Health::default();
-            let h = reg.get(*m).unwrap_or(&empty);
-            health.insert(
-                (*m).to_string(),
-                serde_json::json!({
-                    "cooldown_secs": h.cooldown_until.and_then(|t| t.checked_duration_since(now)).map(|d| d.as_secs()).unwrap_or(0),
-                    "failures": h.failures,
-                }),
-            );
-        }
-        drop(reg);
-        // keystore : persiste les cooldowns de clés
         {
-            let ks = shared.keystore.lock().unwrap();
-            if let Err(e) = ks.save() {
-                eprintln!("[pauvre-router] keystore save KO: {e}");
+            let reg = shared.registry.lock().unwrap();
+            let mut health = serde_json::Map::new();
+            let now = Instant::now();
+            for m in FREE_MODELS {
+                let empty = Health::default();
+                let h = reg.get(*m).unwrap_or(&empty);
+                health.insert(
+                    (*m).to_string(),
+                    serde_json::json!({
+                        "cooldown_secs": h.cooldown_until.and_then(|t| t.checked_duration_since(now)).map(|d| d.as_secs()).unwrap_or(0),
+                        "failures": h.failures,
+                    }),
+                );
+            }
+            drop(reg);
+            if let Err(e) = save(&stats, &serde_json::Value::Object(health)) {
+                eprintln!("[pauvre-router] save KO: {e}");
             }
         }
-        if let Err(e) = save(&stats, &serde_json::Value::Object(health)) {
-            eprintln!("[pauvre-router] save KO: {e}");
+        let ks = shared.keystore.lock().unwrap();
+        if let Err(e) = ks.save() {
+            eprintln!("[pauvre-router] keystore save KO: {e}");
         }
     }
 }
 
-/// Chemin du keystore (override env PAUVRE_KEYS).
 fn keys_path() -> std::path::PathBuf {
     std::env::var("PAUVRE_KEYS")
         .map(std::path::PathBuf::from)
@@ -769,6 +811,12 @@ fn main() {
     });
     load_state(&shared);
 
+    // sauvegarde périodique (stats + santé + cooldowns de clés)
+    {
+        let s = shared.clone();
+        std::thread::spawn(move || periodic_save(s));
+    }
+
     let listener = match TcpListener::bind(("127.0.0.1", PORT)) {
         Ok(l) => l,
         Err(e) => {
@@ -777,22 +825,39 @@ fn main() {
         }
     };
     eprintln!(
-        "[pauvre-router] v{VERSION} sur http://127.0.0.1:{PORT} (keys pool: {n_keys}, cascade: {})",
+        "[pauvre-router] v{VERSION} sur http://127.0.0.1:{PORT} | workers fixes: {N_WORKERS}, file: {QUEUE_CAP} | keys pool: {n_keys} | cascade: {}",
         FREE_MODELS.join(" -> ")
     );
 
-    {
+    // worker pool fixe — la réponse aux zombies : N threads, pas un de plus
+    let queue = Arc::new(Queue::new(QUEUE_CAP));
+    for id in 0..N_WORKERS {
+        let q = queue.clone();
         let s = shared.clone();
-        std::thread::spawn(move || periodic_save(s));
+        std::thread::Builder::new()
+            .name(format!("pauvre-worker-{id}"))
+            .spawn(move || loop {
+                let stream = q.pop();
+                let peer = stream
+                    .peer_addr()
+                    .map(|a| a.ip())
+                    .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+                serve_conn(stream, peer, &s);
+            })
+            .expect("spawn worker");
     }
 
+    // accept boucle : push dans la file ; saturation => close immédiat
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                let s = shared.clone();
-                std::thread::spawn(move || handle_client(stream, &s));
+                if !queue.push(stream) {
+                    // file pleine : répondre vite et fermer (pas de thread créé)
+                }
             }
             Err(e) => eprintln!("[pauvre-router] accept KO: {e}"),
         }
     }
 }
+
+// (fin — les workers bouclent à jamais sur la file ; l'accept jamais)
