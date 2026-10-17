@@ -10,7 +10,8 @@ use pauvre_router::cache::Cache;
 use pauvre_router::classify::{self, ErrorKind};
 use pauvre_router::guard::{Gate, RateLimiter};
 use pauvre_router::http::{read_request, write_response, HttpError, Request};
-use pauvre_router::models::{cascade, pick, Health, Registry, FREE_MODELS};
+use pauvre_router::keystore::{KeyChoice, KeyStore};
+use pauvre_router::models::{cascade, pick, pick_round_robin, Health, Registry, FREE_MODELS};
 use pauvre_router::prompt::{compose_prompt, sanitize_model};
 use pauvre_router::stats::{save, Stats};
 use pauvre_router::VERSION;
@@ -27,6 +28,7 @@ const RATE_PER_MIN: f64 = 20.0; // régime permanent
 const GATE_MAX: u32 = 3; // spawns opencode simultanés max
 const GATE_WAIT: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT: Duration = Duration::from_secs(280);
+const KEY_BACKOFF: u64 = 1800; // cooldown clé après échec (30 min, ×2 par récidive via max)
 
 struct Shared {
     limiter: RateLimiter,
@@ -37,6 +39,13 @@ struct Shared {
     in_flight: AtomicU64,
     /// (ip, timestamp_epoch) des derniers refus anti-spam, pour /admin/stats.
     spam_log: Mutex<Vec<(String, u64)>>,
+    /// Pool de clés API Zen (rotation anti-quota).
+    keystore: Mutex<KeyStore>,
+    /// Mode de routage : "priority" (exhaust le 1er avant de changer)
+    /// ou "roundrobin" (répartit à chaque requête). PAUVRE_MODE.
+    mode: Mutex<String>,
+    /// Curseur round-robin partagé.
+    rr_cursor: Mutex<usize>,
 }
 
 fn now_epoch() -> u64 {
@@ -193,11 +202,16 @@ fn handle_client(stream: TcpStream, shared: &Arc<Shared>) {
             .take(20)
             .map(|(ip, ts)| serde_json::json!({"ip": ip, "at_epoch": ts}))
             .collect();
+        drop(spam);
+        let keys_meta = shared.keystore.lock().unwrap().meta();
+        let mode = shared.mode.lock().unwrap().clone();
         let body = serde_json::json!({
             "version": VERSION,
             "stats": stats,
             "health": health,
             "recent_spam": recent_spam,
+            "keys": keys_meta,
+            "mode": mode,
             "in_flight": shared.in_flight.load(Ordering::Relaxed),
         });
         let _ = write_response(
@@ -222,6 +236,154 @@ fn handle_client(stream: TcpStream, shared: &Arc<Shared>) {
             &mut writer,
             200,
             "OK",
+            "application/json",
+            body.to_string().as_bytes(),
+            &[],
+        );
+        return;
+    }
+
+    // ---- mode de routage (priority | roundrobin) ----
+    // GET  /admin/mode          : mode courant
+    // POST /admin/mode          : {"mode": "priority"|"roundrobin"}
+    if req.method == "GET" && path == "/admin/mode" {
+        let m = shared.mode.lock().unwrap().clone();
+        let body = serde_json::json!({"mode": m});
+        let _ = write_response(
+            &mut writer,
+            200,
+            "OK",
+            "application/json",
+            body.to_string().as_bytes(),
+            &[],
+        );
+        return;
+    }
+    if req.method == "POST" && path == "/admin/mode" {
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body).unwrap_or(serde_json::json!({}));
+        let wanted = body.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+        if wanted == "priority" || wanted == "roundrobin" {
+            *shared.mode.lock().unwrap() = wanted.to_string();
+            let body = serde_json::json!({"mode": wanted, "applied": true});
+            let _ = write_response(
+                &mut writer,
+                200,
+                "OK",
+                "application/json",
+                body.to_string().as_bytes(),
+                &[],
+            );
+        } else {
+            let b = err_body(
+                "mode invalide (priority|roundrobin)",
+                "invalid_request_error",
+                None,
+            );
+            let _ = write_response(
+                &mut writer,
+                400,
+                "Bad Request",
+                "application/json",
+                b.to_string().as_bytes(),
+                &[],
+            );
+        }
+        return;
+    }
+
+    // ---- gestion du pool de clés API (rotation anti-quota) ----
+    // GET  /admin/keys            : méta (jamais les valeurs)
+    // POST /admin/keys/add        : {"key": "sk-..."}          → ajoute
+    // POST /admin/keys/remove     : {"key": "sk-..."}          → retire
+    // POST /admin/keys/reanimate  : {"key": "sk-..."} ou {}    → réactive
+    if req.method == "GET" && path == "/admin/keys" {
+        let ks = shared.keystore.lock().unwrap();
+        let body = ks.meta();
+        drop(ks);
+        let _ = write_response(
+            &mut writer,
+            200,
+            "OK",
+            "application/json",
+            body.to_string().as_bytes(),
+            &[],
+        );
+        return;
+    }
+    if req.method == "POST" && path.starts_with("/admin/keys/") {
+        let action = path.trim_start_matches("/admin/keys/");
+        let body: serde_json::Value = match serde_json::from_slice(&req.body) {
+            Ok(b) => b,
+            Err(_) => serde_json::json!({}),
+        };
+        let key = body
+            .get("key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let (code, body) = {
+            let mut ks = shared.keystore.lock().unwrap();
+            match action {
+                "add" => {
+                    if key.is_empty() {
+                        (
+                            400,
+                            err_body("champ 'key' requis", "invalid_request_error", None),
+                        )
+                    } else if ks.add(&key) {
+                        let _ = ks.save();
+                        (200, serde_json::json!({"added": true, "total": ks.count()}))
+                    } else {
+                        (
+                            400,
+                            err_body(
+                                "cle refusee (doublon ou format invalide: prefixe sk-/zen-, 20-200 chars)",
+                                "invalid_request_error",
+                                None,
+                            ),
+                        )
+                    }
+                }
+                "remove" => {
+                    if ks.remove(&key) {
+                        let _ = ks.save();
+                        (
+                            200,
+                            serde_json::json!({"removed": true, "total": ks.count()}),
+                        )
+                    } else {
+                        (404, err_body("cle inconnue", "invalid_request_error", None))
+                    }
+                }
+                "reanimate" => {
+                    if key.is_empty() {
+                        // toutes : purge complète des marqueurs
+                        let n = ks.count();
+                        ks.reanimate_all();
+                        let _ = ks.save();
+                        (200, serde_json::json!({"reanimated": n}))
+                    } else {
+                        ks.note_success(&key);
+                        let _ = ks.save();
+                        (200, serde_json::json!({"reanimated": 1}))
+                    }
+                }
+                _ => (
+                    404,
+                    err_body(
+                        "action inconnue (add|remove|reanimate)",
+                        "invalid_request_error",
+                        None,
+                    ),
+                ),
+            }
+        };
+        let reason = if code == 200 { "OK" } else { "Bad Request" };
+        let _ = write_response(
+            &mut writer,
+            code,
+            reason,
             "application/json",
             body.to_string().as_bytes(),
             &[],
@@ -375,9 +537,18 @@ fn handle_chat(
     let mut last_err: Option<(serde_json::Value, u16)> = None;
     for _attempt in 0..chain.len() {
         let now = Instant::now();
+        // choix du modèle selon le mode de routage
         let model = {
             let reg = shared.registry.lock().unwrap();
-            match pick(&chain, &reg, now) {
+            let mode = shared.mode.lock().unwrap().clone();
+            let picked = if mode == "roundrobin" {
+                let mut cur = shared.rr_cursor.lock().unwrap();
+                pick_round_robin(&chain, &reg, &mut cur, now)
+            } else {
+                // priority : exhaust le premier dispo (cooldown = exhaustion) avant de passer au suivant
+                pick(&chain, &reg, now)
+            };
+            match picked {
                 Some(m) => m,
                 None => {
                     let b = err_body(
@@ -398,14 +569,23 @@ fn handle_chat(
                 }
             }
         };
+        // rotation de clé : round-robin parmi les actives, anonyme sinon
+        let key_choice = shared.keystore.lock().unwrap().select();
+        let api_key: Option<&str> = match &key_choice {
+            KeyChoice::Use(k) => Some(k.as_str()),
+            KeyChoice::Anonymous => None,
+        };
         let is_fallback = model != model_req;
 
-        match backend::call(&model, &prompt, CALL_TIMEOUT) {
+        match backend::call(&model, &prompt, CALL_TIMEOUT, api_key) {
             Ok(ok) => {
                 let lat = ok.elapsed;
                 {
                     let mut reg = shared.registry.lock().unwrap();
                     reg.entry(model.clone()).or_default().note_success(lat);
+                }
+                if let KeyChoice::Use(k) = &key_choice {
+                    shared.keystore.lock().unwrap().note_success(k);
                 }
                 {
                     let mut s = shared.stats.lock().unwrap();
@@ -445,10 +625,19 @@ fn handle_chat(
                         .or_default()
                         .note_failure(kind, now);
                     eprintln!(
-                        "[pauvre-router] model={model} kind={kind:?} cd={}s raw={}",
+                        "[pauvre-router] model={model} key={} kind={kind:?} cd={}s raw={}",
+                        if api_key.is_some() { "pool" } else { "anon" },
                         cd.as_secs(),
                         raw.chars().take(160).collect::<String>()
                     );
+                }
+                // clé invalidée seulement si le refus vient du compte (pas du modèle)
+                if let KeyChoice::Use(k) = &key_choice {
+                    if kind != ErrorKind::ModelInvalid {
+                        let mut ks = shared.keystore.lock().unwrap();
+                        ks.note_failure(k, kind, KEY_BACKOFF);
+                        let _ = ks.save();
+                    }
                 }
                 {
                     let mut s = shared.stats.lock().unwrap();
@@ -531,13 +720,33 @@ fn periodic_save(shared: Arc<Shared>) {
             );
         }
         drop(reg);
+        // keystore : persiste les cooldowns de clés
+        {
+            let ks = shared.keystore.lock().unwrap();
+            if let Err(e) = ks.save() {
+                eprintln!("[pauvre-router] keystore save KO: {e}");
+            }
+        }
         if let Err(e) = save(&stats, &serde_json::Value::Object(health)) {
             eprintln!("[pauvre-router] save KO: {e}");
         }
     }
 }
 
+/// Chemin du keystore (override env PAUVRE_KEYS).
+fn keys_path() -> std::path::PathBuf {
+    std::env::var("PAUVRE_KEYS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default())
+                .join(".pauvre-router-keys.json")
+        })
+}
+
 fn main() {
+    let routing_mode = std::env::var("PAUVRE_MODE").unwrap_or_else(|_| "priority".into());
+    let keystore = KeyStore::open(keys_path());
+    let n_keys = keystore.count();
     let shared = Arc::new(Shared {
         limiter: RateLimiter::new(RATE_CAPACITY, RATE_PER_MIN),
         gate: Gate::new(GATE_MAX),
@@ -546,6 +755,9 @@ fn main() {
         stats: Mutex::new(Stats::default()),
         in_flight: AtomicU64::new(0),
         spam_log: Mutex::new(Vec::new()),
+        keystore: Mutex::new(keystore),
+        mode: Mutex::new(routing_mode),
+        rr_cursor: Mutex::new(0),
     });
     load_state(&shared);
 
@@ -557,7 +769,7 @@ fn main() {
         }
     };
     eprintln!(
-        "[pauvre-router] v{VERSION} sur http://127.0.0.1:{PORT} (cascade: {})",
+        "[pauvre-router] v{VERSION} sur http://127.0.0.1:{PORT} (keys pool: {n_keys}, cascade: {})",
         FREE_MODELS.join(" -> ")
     );
 

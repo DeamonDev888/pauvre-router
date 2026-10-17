@@ -37,15 +37,26 @@ pub fn opencode_path() -> String {
 }
 
 /// Exécute `opencode run --model opencode/<model>` avec le prompt sur stdin.
-/// Env épuré mais suffisant (USERPROFILE/HOME pour la config opencode).
-pub fn call(model: &str, prompt: &str, timeout: Duration) -> Result<BackendOk, BackendError> {
+/// `api_key` = Some(clé) → var OPENCODE_API_KEY passée au spawn ;
+/// None → la var est explicitement RETIRÉE (mode anonyme, jamais de mix).
+pub fn call(
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+    api_key: Option<&str>,
+) -> Result<BackendOk, BackendError> {
     let exe = opencode_path();
-    let mut child = Command::new(&exe)
-        .args(["run", "--model", &format!("opencode/{model}")])
+    let mut cmd = Command::new(&exe);
+    cmd.args(["run", "--model", &format!("opencode/{model}")])
         .env("USERPROFILE", "C:\\Users\\Deamon")
         .env("HOMEDRIVE", "C:")
         .env("HOMEPATH", "\\Users\\Deamon")
-        .env("PATH", r"C:\Windows\System32")
+        .env("PATH", r"C:\Windows\System32");
+    match api_key {
+        Some(k) => cmd.env("OPENCODE_API_KEY", k),
+        None => cmd.env_remove("OPENCODE_API_KEY"),
+    };
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

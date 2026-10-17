@@ -11,9 +11,13 @@ pub const COOLDOWN_TRANSIENT: Duration = Duration::from_secs(10);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 
 /// Modèles gratuits frontière, ordre de cascade (qualité perçue décroissante).
+/// ⭐ glm-5.3-flash-free : frontière, gratuit depuis oct 2026 (testé OK 15,5 s).
+/// space-bunny : le plus rapide (2-4 s). nemotron-3-ultra : écarté (timeout >100 s).
 pub const FREE_MODELS: &[&str] = &[
+    "glm-5.3-flash-free",
     "space-bunny-free",
     "mimo-v2.6-flash-free",
+    "deepseek-v4.1-flash-free",
     "nemotron-3.5-lightning-free",
     "longcat-2.5-preview-free",
 ];
@@ -78,6 +82,26 @@ pub fn pick(cascade: &[String], registry: &Registry, now: Instant) -> Option<Str
         .iter()
         .find(|m| registry.get(*m).map(|h| h.available(now)).unwrap_or(true))
         .cloned()
+}
+
+/// Round-robin : part de `start` dans la cascade, retourne le premier
+/// modèle disponible, et avance le curseur (répartit la charge).
+pub fn pick_round_robin(
+    cascade: &[String],
+    registry: &Registry,
+    start: &mut usize,
+    now: Instant,
+) -> Option<String> {
+    let n = cascade.len();
+    for i in 0..n {
+        let idx = (start.wrapping_add(i)) % n;
+        let m = &cascade[idx];
+        if registry.get(m).map(|h| h.available(now)).unwrap_or(true) {
+            *start = (idx + 1) % n;
+            return Some(m.clone());
+        }
+    }
+    None
 }
 
 /// Sérialise l'état de santé d'un modèle pour le dump JSON.
@@ -149,7 +173,7 @@ mod tests {
         reg.insert("space-bunny-free".into(), h);
         assert_eq!(
             pick(&c, &reg, now).unwrap(),
-            "mimo-v2.6-flash-free" // saute le premier en cooldown
+            "glm-5.3-flash-free" // saute le premier en cooldown
         );
         // tous en cooldown => None
         for m in FREE_MODELS {
@@ -160,6 +184,28 @@ mod tests {
         assert!(pick(&c, &reg, now).is_none());
         // cooldown expiré => de nouveau dispo
         assert!(pick(&c, &reg, now + COOLDOWN_EXHAUSTED).is_some());
+    }
+
+    #[test]
+    fn round_robin_repartit_la_charge() {
+        let now = Instant::now();
+        let reg: Registry = HashMap::new();
+        let c = cascade("space-bunny-free");
+        let mut idx = 0usize;
+        // départ sur glm (index 1 de la chaîne space-bunny), puis mimo, etc.
+        let a = pick_round_robin(&c, &reg, &mut idx, now).unwrap();
+        let b = pick_round_robin(&c, &reg, &mut idx, now).unwrap();
+        let cc = pick_round_robin(&c, &reg, &mut idx, now).unwrap();
+        assert_ne!(a, b);
+        assert_ne!(b, cc);
+        // skip des cooldowns : glm en cooldown → passe au suivant
+        let mut reg2: Registry = HashMap::new();
+        let mut h2 = Health::default();
+        h2.note_failure(ErrorKind::Exhausted, now);
+        reg2.insert("glm-5.3-flash-free".into(), h2);
+        let mut idx2 = 1usize;
+        let next = pick_round_robin(&c, &reg2, &mut idx2, now).unwrap();
+        assert_ne!(next, "glm-5.3-flash-free");
     }
 
     #[test]

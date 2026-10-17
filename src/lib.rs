@@ -13,6 +13,7 @@ pub mod cache;
 pub mod classify;
 pub mod guard;
 pub mod http;
+pub mod keystore;
 pub mod models;
 pub mod prompt;
 pub mod stats;

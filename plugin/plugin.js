@@ -119,6 +119,7 @@ export function register(ctx) {
             children: [
               jsx("span", { style: { fontWeight: "600" }, children: "🗑️ Router des Pauvres" }),
               jsx(Badge, { children: "v" + (data ? data.version : "?") }),
+              data && data.mode ? jsx(Badge, { kind: data.mode === "roundrobin" ? "info" : "default", children: data.mode }) : null,
               data ? jsx(Badge, { children: "in-flight " + data.in_flight }) : null,
             ],
           }),
