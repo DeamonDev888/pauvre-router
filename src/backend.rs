@@ -36,7 +36,8 @@ pub fn opencode_path() -> String {
     std::env::var("PAUVRE_OPENCODE").unwrap_or_else(|_| DEFAULT_OPENCODE.to_string())
 }
 
-/// Exécute `opencode run --model opencode/<model>` avec le prompt sur stdin.
+/// Exécute `opencode run --agent <plan|build> --model opencode/<model>`
+/// avec le prompt sur stdin.
 /// `api_key` = Some(clé) → var OPENCODE_API_KEY passée au spawn ;
 /// None → la var est explicitement RETIRÉE (mode anonyme, jamais de mix).
 pub fn call(
@@ -44,13 +45,25 @@ pub fn call(
     prompt: &str,
     timeout: Duration,
     api_key: Option<&str>,
+    use_agent_build: bool,
+    workdir: Option<&str>,
 ) -> Result<BackendOk, BackendError> {
-    call_at(&opencode_path(), model, prompt, timeout, api_key, &[])
+    call_at(
+        &opencode_path(),
+        model,
+        prompt,
+        timeout,
+        api_key,
+        &[],
+        use_agent_build,
+        workdir,
+    )
 }
 
 /// Comme [`call`] mais avec un exe imposé (tests E2E : binaire stub).
 /// `extra_env` : variables additionnelles posées sur le spawn (le stub
 /// de test lit `STUB_FAIL` ; la prod n'en passe aucune).
+#[allow(clippy::too_many_arguments)]
 pub fn call_at(
     exe: &str,
     model: &str,
@@ -58,26 +71,64 @@ pub fn call_at(
     timeout: Duration,
     api_key: Option<&str>,
     extra_env: &[(String, String)],
+    use_agent_build: bool,
+    workdir: Option<&str>,
+) -> Result<BackendOk, BackendError> {
+    call_at_inner(
+        exe,
+        model,
+        prompt,
+        timeout,
+        api_key,
+        extra_env,
+        use_agent_build,
+        workdir,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_at_inner(
+    exe: &str,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+    api_key: Option<&str>,
+    extra_env: &[(String, String)],
+    use_agent_build: bool,
+    workdir: Option<&str>,
 ) -> Result<BackendOk, BackendError> {
     let mut cmd = Command::new(exe);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    // `--agent plan` : l'agent `build` par défaut est un agent codeur
-    // ANGLAIS avec outils — il répond en anglais et coupe après « : »
-    // quand un appel d'outil n'aboutit pas en mode non-interactif.
-    // L'agent `plan` répond en texte, dans la langue de l'utilisateur.
+    // Choix d'agent opencode :
+    // - `build` (par défaut du CLI) : agent codeur avec outils réels
+    //   (bash/read/edit) — utilisé quand le CLIENT déclare des tools :
+    //   le backend peut alors exécuter la tâche pour de vrai ;
+    // - `plan` : agent texte sans outils — sinon le modèle annonce
+    //   « I'll read the file : » et s'arrête en attendant un tool_call
+    //   qui ne viendra jamais (symptômes vus en prod Hermes).
+    let agent = if use_agent_build { "build" } else { "plan" };
     cmd.args([
         "run",
         "--agent",
-        "plan",
+        agent,
         "--model",
         &format!("opencode/{model}"),
-    ])
-    .env("USERPROFILE", "C:\\Users\\Deamon")
-    .env("HOMEDRIVE", "C:")
-    .env("HOMEPATH", "\\Users\\Deamon")
-    .env("PATH", r"C:\Windows\System32");
+    ]);
+    // Workdir du client (extrait du system prompt) : l'agent build ne
+    // lit/écrit QUE dans son cwd — sans ça il se fait auto-rejeter sur
+    // external_directory et rend une réponse vide (« permission requested…
+    // auto-rejecting », vu en prod).
+    if let Some(dir) = workdir {
+        if std::path::Path::new(dir).is_dir() {
+            cmd.args(["--dir", dir]);
+        }
+    }
+    cmd.env("USERPROFILE", "C:\\Users\\Deamon")
+        .env("HOMEDRIVE", "C:")
+        .env("HOMEPATH", "\\Users\\Deamon")
+        .env("PATH", r"C:\Windows\System32");
     match api_key {
         Some(k) => cmd.env("OPENCODE_API_KEY", k),
         None => cmd.env_remove("OPENCODE_API_KEY"),

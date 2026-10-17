@@ -19,7 +19,7 @@ use crate::keystore::{KeyChoice, KeyStore};
 use crate::models::{
     cascade, pick, pick_robin_smart, pick_round_robin, Health, Registry, FREE_MODELS, ROBIN_MODEL,
 };
-use crate::prompt::{compose_prompt, sanitize_model};
+use crate::prompt::{compose_prompt, extract_workdir, sanitize_model};
 use crate::stats::{save_to, Stats};
 use crate::update::Updater;
 use crate::VERSION;
@@ -769,7 +769,13 @@ fn handle_chat(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let prompt = match compose_prompt(&messages) {
+    let has_tools = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    let workdir = extract_workdir(&messages);
+    let prompt = match compose_prompt(&messages, has_tools) {
         Ok(p) => p,
         Err(e) => {
             let b = err_body(&e, "invalid_request_error", None);
@@ -783,6 +789,13 @@ fn handle_chat(
             );
             return;
         }
+    };
+    // AVEC tools (agent build) : la tâche réelle (audit, corrections,
+    // multi-fichiers) prend 2-4 min — timeout dédié, PAS le 80 s texte.
+    let call_timeout = if has_tools {
+        Duration::from_secs(240)
+    } else {
+        shared.call_timeout
     };
 
     // 3) cache
@@ -817,23 +830,34 @@ fn handle_chat(
     for _attempt in 0..chain.len() {
         let now = Instant::now();
         // (modèle, timeout effectif) : le robin intelligent renvoie un
-        // timeout adaptatif par modèle ; les autres chemins gardent la base
+        // timeout adaptatif par modèle ; les autres chemins gardent la base.
+        // AVEC tools (agent build) : timeout adaptatif désactivé — l'agent
+        // travaille 30-60 s+ sur une vraie tâche, un timeout court couperait
+        // un travail en cours ; on garde la base pleine.
         let (model, effective_timeout) = {
             let reg = shared.registry.lock().unwrap();
             let mode = shared.mode.lock().unwrap().clone();
-            let picked = if model_req == ROBIN_MODEL {
+            let picked = if model_req == ROBIN_MODEL && !has_tools {
                 pick_robin_smart(
                     &chain,
                     &reg,
                     &mut shared.rr_cursor.lock().unwrap(),
                     now,
-                    shared.call_timeout,
+                    call_timeout,
                 )
-            } else if mode == "roundrobin" {
+            } else if mode == "roundrobin" && !has_tools {
                 pick_round_robin(&chain, &reg, &mut shared.rr_cursor.lock().unwrap(), now)
-                    .map(|m| (m, shared.call_timeout))
+                    .map(|m| (m, call_timeout))
+            } else if model_req == ROBIN_MODEL {
+                // robin + tools : exploitation pure (pas d'exploration en
+                // pleine tâche lourde), timeout = base pleine
+                let reg2 = &reg;
+                chain
+                    .iter()
+                    .find(|m| reg2.get(*m).map(|h| h.available(now)).unwrap_or(true))
+                    .map(|m| (m.clone(), call_timeout))
             } else {
-                pick(&chain, &reg, now).map(|m| (m, shared.call_timeout))
+                pick(&chain, &reg, now).map(|m| (m, call_timeout))
             };
             match picked {
                 Some(p) => p,
@@ -871,6 +895,8 @@ fn handle_chat(
             effective_timeout,
             api_key,
             &shared.backend_env,
+            has_tools,
+            workdir.as_deref(),
         ) {
             Ok(ok) => {
                 let lat = ok.elapsed;

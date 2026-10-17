@@ -19,6 +19,8 @@ fn call_at_echo_chemin_nominal() {
         Duration::from_secs(10),
         None,
         &[],
+        false,
+        None,
     )
     .expect("stub doit répondre");
     assert_eq!(ok.text, "ack opencode/glm-5.3-flash-free: PING unit");
@@ -35,6 +37,8 @@ fn call_at_echec_exhaustion_classee() {
         Duration::from_secs(10),
         None,
         &env,
+        false,
+        None,
     )
     .expect_err("STUB_FAIL doit faire échouer");
     match err {
@@ -54,6 +58,8 @@ fn call_at_timeout_sur_backend_muet() {
         Duration::from_millis(300),
         None,
         &[],
+        false,
+        None,
     )
     .expect_err("SLOW doit dépasser le timeout");
     assert!(matches!(err, BackendError::Timeout { .. }));
@@ -70,11 +76,23 @@ fn call_at_passe_la_cle_api_au_spawn() {
         Duration::from_secs(10),
         Some(&k),
         &[],
+        false,
+        None,
     )
     .expect("stub doit répondre");
     assert_eq!(ok.text, format!("KEY={k} model=opencode/m"));
     // sans clé : explicitement anonyme
-    let ok2 = call_at(stub(), "m", "ECHOKEY", Duration::from_secs(10), None, &[]).unwrap();
+    let ok2 = call_at(
+        stub(),
+        "m",
+        "ECHOKEY",
+        Duration::from_secs(10),
+        None,
+        &[],
+        false,
+        None,
+    )
+    .unwrap();
     assert!(ok2.text.starts_with("KEY=ANONYMOUS"));
 }
 
@@ -89,6 +107,8 @@ fn call_at_env_additionnelle_positionnee() {
         Duration::from_secs(10),
         None,
         &env,
+        false,
+        None,
     )
     .expect_err("le modèle listé doit échouer");
     assert!(matches!(err, BackendError::Failed { .. }));
@@ -99,6 +119,8 @@ fn call_at_env_additionnelle_positionnee() {
         Duration::from_secs(10),
         None,
         &env,
+        false,
+        None,
     )
     .expect("le modèle hors liste doit passer");
     assert_eq!(ok.text, "ack opencode/deepseek-v4.1-flash-free: x");
@@ -113,6 +135,8 @@ fn call_at_spawn_inexistant_erreur_failed() {
         Duration::from_secs(5),
         None,
         &[],
+        false,
+        None,
     )
     .expect_err("spawn impossible = Failed");
     assert!(matches!(err, BackendError::Failed { .. }));

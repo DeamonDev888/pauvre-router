@@ -388,23 +388,26 @@ fn e2e_tous_en_cooldown_429() {
 
 #[test]
 fn e2e_antispam_429_puis_requete_normale_ok() {
-    // bucket serré : 2 rafale, recharge quasi nulle sur la durée du test
+    // bucket serré : 3 rafale (1 de marge pour un éventuel rejeu RST),
+    // recharge quasi nulle sur la durée du test
     let i = start("antispam", |c| {
-        c.rate_capacity = 2;
+        c.rate_capacity = 3;
         c.rate_per_min = 0.001;
     });
     // 1) santé : ne passe PAS par le limiter (endpoints lecture) — ok
     let (h, _) = req(i.port, "GET", "/health", b"", false).unwrap();
     assert_eq!(h, 200);
-    // 2) deux chats passent (rafale), le 3e est bloqué
+    // 2) trois chats passent (rafale), le 4e est bloqué
     let (a, _) = chat(i.port, "glm-5.3-flash-free", "PONG one").unwrap();
     let (b, _) = chat(i.port, "glm-5.3-flash-free", "PONG two").unwrap();
     let (c, vc) = chat(i.port, "glm-5.3-flash-free", "PONG three").unwrap();
+    let (d, vd) = chat(i.port, "glm-5.3-flash-free", "PONG four").unwrap();
     assert_eq!(a, 200);
     assert_eq!(b, 200);
-    assert_eq!(c, 429, "3e requête doit être bloquée: {vc}");
-    assert_eq!(vc["error"]["type"], "rate_limit_error");
-    assert!(vc["error"]["retry_after"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(c, 200);
+    assert_eq!(d, 429, "4e requête doit être bloquée: {vd}");
+    assert_eq!(vd["error"]["type"], "rate_limit_error");
+    assert!(vd["error"]["retry_after"].as_u64().unwrap_or(0) >= 1);
     // 3) le refus est tracé (>= : un RST-fantôme peut rejouer une requête)
     let stats = get_json(i.port, "/admin/stats");
     assert!(

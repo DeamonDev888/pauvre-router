@@ -1,29 +1,46 @@
 //! Composition du prompt et validation des noms de modèle.
 
 /// Consigne injectée entre le system prompt du client et la question.
-/// Le router est un proxy TEXTE : opencode ne peut exécuter aucun des
-/// tools déclarés par le client (Hermes envoie terminal/read_file/...).
-/// Sans cet avertissement, le modèle annonce « I'll read the file : »
-/// puis s'arrête en attendant un tool_call qui ne viendra jamais
-/// (vu en prod Hermes). La consigne force aussi la langue de la question.
-const PROXY_RULES: &str = "[Règles du proxy — prioritaires]\n\
+/// Sans outils déclarés par le client : mode TEXTE PUR — opencode ne peut
+/// exécuter rien, le modèle ne doit ni annoncer d'action ni attendre un
+/// tool_call (symptômes vus en prod Hermes : anglais + coupure sur « : »).
+const TEXT_ONLY_RULES: &str = "[Règles du proxy — prioritaires]\n\
 - Mode texte pur : AUCUN outil disponible (pas de terminal, pas de lecture \
 de fichiers, pas de web, pas d'action). N'écris JAMAIS « je vais \
-lire/exécuter/vérifier » ni « I'll ... » : réponds directement avec ce \
-que tu sais, ou dis que tu ne peux pas agir.\n\
+lire/exécuter/vérifier » ni « I'll ... » : réponds directement et \
+COMPLÈTEMENT avec ce que tu sais, ou dis que tu ne peux pas agir.\n\
 - Réponds dans la langue du dernier message utilisateur (français si la \
 question est en français) — même si les consignes système sont en anglais.\n\
-- Sois complet : jamais de réponse qui s'arrête sur « : » ou « … » en \
-attendant une suite que tu ne peux pas produire.";
+- Garde l'identité et la persona définies par la consigne système.";
+
+/// Avec tools déclarés : le backend opencode exécute RÉELLEMENT via son
+/// agent build (bash/read/edit) — il ne faut PAS lui interdire d'agir,
+/// ni lui demander de tout résumer : laisse-le travailler et rapporter.
+const AGENT_RULES: &str = "[Règles d'exécution — prioritaires]\n\
+- Tu as des outils réels (terminal, lecture/écriture de fichiers) : \
+UTILISE-LES pour accomplir la tâche, ne te contente pas de décrire ce \
+que tu ferais. Termine par un RÉSUMÉ COMPLET du travail fait et des \
+résultats obtenus.\n\
+- Réponds dans la langue du dernier message utilisateur (français si la \
+question est en français).";
+
+/// Consigne selon que le client déclare des tools ou non.
+fn proxy_rules(has_tools: bool) -> &'static str {
+    if has_tools {
+        AGENT_RULES
+    } else {
+        TEXT_ONLY_RULES
+    }
+}
 
 /// Aplatit les `messages` OpenAI en un prompt texte unique pour
 /// `opencode run` (stdin). Même sémantique que l'ancien pont JS :
 /// dernier message user = question, system = consigne préfixée,
-/// PROXY_RULES inséré juste avant la question (les LLM suivent mieux
+/// règles proxy insérées juste avant la question (les LLM suivent mieux
 /// les consignes les plus proches de la fin du prompt), et les DERNIERS
 /// échanges user/assistant conservés comme contexte (sans quoi une
 /// conversation Hermes perd le fil après le premier tour).
-pub fn compose_prompt(messages: &serde_json::Value) -> Result<String, String> {
+pub fn compose_prompt(messages: &serde_json::Value, has_tools: bool) -> Result<String, String> {
     let arr = messages
         .as_array()
         .ok_or_else(|| "messages: tableau attendu".to_string())?;
@@ -80,11 +97,74 @@ pub fn compose_prompt(messages: &serde_json::Value) -> Result<String, String> {
     } else {
         format!("[Conversation récente]\n{ctx}\n[Question]\n{last_user}")
     };
+    let rules = proxy_rules(has_tools);
     if sys.is_empty() {
-        Ok(format!("{PROXY_RULES}\n\n{q}"))
+        Ok(format!("{rules}\n\n{q}"))
     } else {
-        Ok(format!("[Consigne système]\n{sys}\n\n{PROXY_RULES}\n\n{q}"))
+        Ok(format!("[Consigne système]\n{sys}\n\n{rules}\n\n{q}"))
     }
+}
+
+/// Extrait le répertoire de travail du client depuis les messages system.
+/// Hermes le déclare sous des formes variées (« Working directory: X »,
+/// « cwd: X », « Current working directory: X »). Retourne None sinon.
+/// Sans cwd, l'agent build d'opencode se fait auto-rejeter sur toute
+/// lecture hors de SON répertoire (external_directory) et répond vide.
+pub fn extract_workdir(messages: &serde_json::Value) -> Option<String> {
+    let arr = messages.as_array()?;
+    for m in arr {
+        if m.get("role").and_then(|v| v.as_str()) != Some("system") {
+            continue;
+        }
+        let text = match m.get("content") {
+            Some(serde_json::Value::String(s)) => s.as_str(),
+            Some(serde_json::Value::Array(parts)) => {
+                // pas de String stable sans allocation ; on cherche direct
+                let joined: Vec<&str> = parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect();
+                let tmp = joined.join("\n");
+                for line in tmp.lines() {
+                    if let Some(d) = parse_workdir_line(line) {
+                        return Some(d);
+                    }
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        for line in text.lines() {
+            if let Some(d) = parse_workdir_line(line) {
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+fn parse_workdir_line(line: &str) -> Option<String> {
+    let l = line.trim();
+    let markers = [
+        "working directory:",
+        "working directory :",
+        "répertoire de travail :",
+        "repertoire de travail :",
+        "cwd:",
+        "cwd :",
+        "current working directory:",
+    ];
+    for mk in markers {
+        if let Some(rest) = l.to_lowercase().find(mk) {
+            let v = l[rest + mk.len()..].trim();
+            // élaguer ponctuation de fin (point, guillemets)
+            let v = v.trim_end_matches(['.', ',', '"', '\'']);
+            if !v.is_empty() && (v.contains('\\') || v.contains('/') || v.contains(':')) {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// N'accepte que [a-zA-Z0-9._-] (1..=80 chars) — le nom va dans argv,
@@ -104,7 +184,7 @@ mod tests {
     #[test]
     fn compose_simple_user() {
         let msgs = json!([{"role": "user", "content": "salut"}]);
-        let p = compose_prompt(&msgs).unwrap();
+        let p = compose_prompt(&msgs, false).unwrap();
         // la question est en clair et le prompt se termine par elle
         assert!(p.contains("[Question]\nsalut"), "p={p}");
         assert!(p.ends_with("salut"));
@@ -119,7 +199,7 @@ mod tests {
             {"role": "system", "content": "tu es concis"},
             {"role": "user", "content": "ping"}
         ]);
-        let p = compose_prompt(&msgs).unwrap();
+        let p = compose_prompt(&msgs, false).unwrap();
         assert!(p.starts_with("[Consigne système]\ntu es concis"), "p={p}");
         assert!(
             p.contains("Règles du proxy"),
@@ -139,7 +219,7 @@ mod tests {
         let msgs = json!([
             {"role": "user", "content": [{"type": "text", "text": "ligne1"}, {"type": "text", "text": "ligne2"}]}
         ]);
-        let p = compose_prompt(&msgs).unwrap();
+        let p = compose_prompt(&msgs, false).unwrap();
         assert!(p.ends_with("[Question]\nligne1\nligne2"), "p={p}");
     }
 
@@ -150,7 +230,7 @@ mod tests {
             {"role": "assistant", "content": "Enchanté Marc !"},
             {"role": "user", "content": "tu te souviens de mon prénom ?"}
         ]);
-        let p = compose_prompt(&msgs).unwrap();
+        let p = compose_prompt(&msgs, false).unwrap();
         // la question est le DERNIER user, pas le premier
         assert!(
             p.ends_with("[Question]\ntu te souviens de mon prénom ?"),
@@ -172,7 +252,7 @@ mod tests {
             msgs.push(json!({"role": "assistant", "content": format!("a{i}")}));
         }
         msgs.push(json!({"role": "user", "content": "final"}));
-        let p = compose_prompt(&json!(msgs)).unwrap();
+        let p = compose_prompt(&json!(msgs), false).unwrap();
         // seuls les 6 derniers échanges sont gardés : u0/u1 doivent avoir disparu
         assert!(!p.contains("u0 "), "historique non borné: {p}");
         assert!(p.contains("u9"), "les récents sont là");
@@ -182,8 +262,8 @@ mod tests {
     #[test]
     fn compose_empty_refused() {
         let msgs = json!([{"role": "assistant", "content": "moi seul"}]);
-        assert!(compose_prompt(&msgs).is_err());
-        assert!(compose_prompt(&json!("pas un tableau")).is_err());
+        assert!(compose_prompt(&msgs, false).is_err());
+        assert!(compose_prompt(&json!("pas un tableau"), false).is_err());
     }
 
     #[test]
