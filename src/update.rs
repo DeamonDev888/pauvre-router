@@ -62,29 +62,36 @@ impl Updater {
     }
 
     /// Check synchrone (6 s max) : interroge l'API GitHub Releases.
-    /// Ne panic jamais — en cas d'échec, le statut précédent reste.
+    /// Ne panic jamais — en cas d'échec, le statut précédent reste ET
+    /// le flag est réarmé (sinon le premier échec de réseau brickerait
+    /// tous les checks suivants — bug vu en prod au boot avant réseau).
     pub fn check(&self) -> UpdateStatus {
         // un seul check à la fois
         if self.inflight.swap(1, Ordering::Relaxed) == 1 {
             return self.status();
         }
         let result = fetch_latest();
-        let next = match result {
+        match result {
             Some((tag, url)) => {
                 let update_available = semver_gt(&tag, &self.current);
-                UpdateStatus {
+                let next = UpdateStatus {
                     current: self.current.clone(),
                     latest: Some(tag),
                     update_available,
                     url,
                     checked_at_epoch: epoch_now(),
-                }
+                };
+                *self.status.lock().unwrap() = next.clone();
+                self.inflight.store(0, Ordering::Relaxed);
+                next
             }
-            None => return self.status(), // réseau KO : on garde l'ancien
-        };
-        *self.status.lock().unwrap() = next.clone();
-        self.inflight.store(0, Ordering::Relaxed);
-        next
+            None => {
+                // réseau KO : on garde l'ancien statut MAIS on réarme,
+                // le prochain check (horaire ou forcé) doit pouvoir partir
+                self.inflight.store(0, Ordering::Relaxed);
+                self.status()
+            }
+        }
     }
 
     /// Boucle de fond : check au boot puis toutes les CHECK_INTERVAL.
