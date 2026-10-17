@@ -1000,3 +1000,106 @@ pub fn serve(bound: BoundServer) {
     }
     let _ = shared; // gardé vivant par les workers ; ici pour la signature
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn err_body_structure_et_retry_after() {
+        let simple = err_body("boom", "upstream_error", None);
+        assert_eq!(simple["error"]["message"], "boom");
+        assert_eq!(simple["error"]["type"], "upstream_error");
+        assert!(simple["error"].get("retry_after").is_none());
+
+        let avec = err_body("trop vite", "rate_limit_error", Some(7));
+        assert_eq!(avec["error"]["retry_after"], 7);
+    }
+
+    #[test]
+    fn completion_body_conforme_openai() {
+        let b = completion_body("salut", "glm-5.3-flash-free");
+        assert_eq!(b["object"], "chat.completion");
+        assert_eq!(b["model"], "glm-5.3-flash-free");
+        assert_eq!(b["choices"][0]["finish_reason"], "stop");
+        assert_eq!(b["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(b["choices"][0]["message"]["content"], "salut");
+        assert!(b["created"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(b["usage"]["total_tokens"], 0);
+    }
+
+    /// Décode un corps SSE en liste de payloads (dernier = "[DONE]").
+    fn sse_payloads(body: &str) -> Vec<String> {
+        body.split("\n\n")
+            .filter(|l| l.starts_with("data: "))
+            .map(|l| l.trim_start_matches("data: ").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn sse_body_sequence_complete_hermes() {
+        let body = sse_body("PONG", "space-bunny-free");
+        let p = sse_payloads(&body);
+        // rôle → contenu → stop → [DONE]
+        assert_eq!(p.len(), 4, "body={body}");
+        assert_eq!(p.last().unwrap(), "[DONE]");
+        let chunks: Vec<serde_json::Value> = p[..3]
+            .iter()
+            .map(|j| serde_json::from_str(j).expect("chunk json valide"))
+            .collect();
+        for c in &chunks {
+            assert_eq!(c["object"], "chat.completion.chunk");
+            assert_eq!(c["model"], "space-bunny-free");
+        }
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "PONG");
+        assert_eq!(chunks[2]["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn sse_body_texte_vide_reste_valide() {
+        let body = sse_body("", "m");
+        let p = sse_payloads(&body);
+        // pas de chunk contenu, mais rôle + stop + [DONE]
+        assert_eq!(p.len(), 3);
+        assert_eq!(p.last().unwrap(), "[DONE]");
+        assert!(!body.contains("\"content\":\"\"},")); // pas de chunk contenu vide
+    }
+
+    #[test]
+    fn config_production_valeurs_histriques() {
+        let cfg = ServerConfig::production();
+        assert_eq!(cfg.port, 4445);
+        assert_eq!(cfg.call_timeout, Duration::from_secs(80));
+        assert_eq!(cfg.rate_capacity, 5);
+        assert_eq!(cfg.gate_max, 3);
+        assert!(cfg.backend_env.is_empty());
+    }
+
+    #[test]
+    fn shared_new_expose_la_config() {
+        let dir = std::env::temp_dir().join(format!("pauvre-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = ServerConfig {
+            port: 0,
+            state_path: dir.join("s.json"),
+            keys_path: dir.join("k.json"),
+            backend_exe: "nope.exe".into(),
+            backend_env: vec![("STUB_FAIL".into(), "glm-5.3-flash-free".into())],
+            call_timeout: Duration::from_millis(10),
+            rate_capacity: 1,
+            rate_per_min: 1.0,
+            gate_max: 2,
+            gate_wait: Duration::from_millis(3),
+            save_interval: Duration::from_secs(9),
+            mode: "roundrobin".into(),
+        };
+        let shared = Shared::new(&cfg);
+        assert_eq!(shared.call_timeout, Duration::from_millis(10));
+        assert_eq!(shared.gate_wait, Duration::from_millis(3));
+        assert_eq!(shared.backend_env.len(), 1);
+        assert_eq!(shared.mode.lock().unwrap().as_str(), "roundrobin");
+        assert_eq!(shared_backend_exe(&shared), "nope.exe", "exe figé au boot");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

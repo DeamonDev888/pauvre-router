@@ -175,9 +175,9 @@ Ajoutez ce provider dans votre configuration Hermes (`config.yaml`) :
 
 ```yaml
 custom_providers:
-- name: zen-free
+- name: router-des-pauvres
   base_url: http://127.0.0.1:4445/v1
-  api_key: public
+  api_key: pauvre
   api_mode: chat_completions
   models:
     frontier-robin-free: {}
@@ -188,10 +188,10 @@ custom_providers:
 
 > ⚠️ **Note :** La liste `models:` du `config.yaml` est statique : c'est elle qui alimente le picker de modèles d'Hermes.
 
-Résultat dans le picker d'Hermes Desktop — le groupe **ZEN-FREE** avec les 4 modèles, sélection de `space-bunny-free` (contexte XHIGH) :
+Résultat dans le picker d'Hermes Desktop — le groupe **ROUTER-DES-PAUVRES** avec les 4 modèles, sélection de `space-bunny-free` (contexte XHIGH) :
 
 <p align="center">
-  <img src="assets/hermes-picker.png" alt="Modèles zen-free dans le picker Hermes Desktop" width="85%" />
+  <img src="assets/hermes-picker.png" alt="Modèles router-des-pauvres dans le picker Hermes Desktop" width="85%" />
 </p>
 
 ### 🖥️ Plugin Desktop Hermes
@@ -208,7 +208,7 @@ Consultez la page **[Releases](../../releases)** pour télécharger les binaires
 
 ## 🧪 Tests
 
-**59 tests** (43 unitaires + 16 E2E), tous verts en `cargo test` comme en `cargo test --release` :
+**73 tests** (49 unitaires + 6 backend stub + 18 E2E), tous verts en `cargo test` comme en `cargo test --release` :
 
 - **E2E** (`tests/e2e.rs`) : de vrais serveurs démarrent sur des ports éphémères (mêmes workers que la prod) et parlent TCP pour de vrai — un stub `opencode` (`src/bin/stub-opencode.rs`, piloté par env `STUB_FAIL`) remplace le CLI réel. Couverture : cascade de fallback, cooldowns, 429 tous-cooldowns, anti-spam token bucket, SSE streaming, cache, rotation de clés prouvée côté spawn, timeout backend, keep-alive, 413, persistance de l'état sur reboot, 12 requêtes concurrentes.
 

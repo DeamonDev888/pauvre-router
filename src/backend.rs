@@ -166,4 +166,8 @@ mod tests {
         std::env::remove_var("PAUVRE_OPENCODE");
         assert_eq!(opencode_path(), DEFAULT_OPENCODE);
     }
+
+    // Les tests d'exécution du backend (call_at contre le binaire stub)
+    // vivent dans tests/backend_stub.rs : CARGO_BIN_EXE_* n'est défini
+    // que pour les cibles d'intégration, pas pour les tests de la lib.
 }
