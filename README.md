@@ -9,7 +9,7 @@
   <a href="#-fonctionnalités-clés"><img src="https://img.shields.io/badge/Taille-~650_KB-3b82f6?style=for-the-badge&logo=cargo&logoColor=white" alt="Binaire 650KB" /></a>
   <a href="#-modèles-frontière-gratuits--matrice-comparative"><img src="https://img.shields.io/badge/Budget_API-0_€_(100%25_Gratuit)-10b981?style=for-the-badge&logo=free&logoColor=white" alt="100% Gratuit" /></a>
   <a href="#-endpoints-http"><img src="https://img.shields.io/badge/Endpoints-Standard-8b5cf6?style=for-the-badge&logo=http&logoColor=white" alt="Endpoints Standard" /></a>
-  <a href="#-modèles-frontière-gratuits--matrice-comparative"><img src="https://img.shields.io/badge/Modèles-3_Frontières-ec4899?style=for-the-badge" alt="3 Modèles Frontière" /></a>
+  <a href="#-modèles-frontière-gratuits--matrice-comparative"><img src="https://img.shields.io/badge/Modèles-4_Frontières-ec4899?style=for-the-badge" alt="4 Modèles Frontière" /></a>
   <a href="#-licence"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT" /></a>
 </p>
 
@@ -67,14 +67,15 @@ Impossible d'appeler l'API en direct avec un simple `curl` ou un client OpenAI s
 
 | Modèle | Latence | Spécialité | Statut |
 |---|---|---|---|
-| `space-bunny-free` | **6,0 s** ⚡ | Le sprinter ultra-rapide pour questions courtes et chat | 🟢 Gratuit Zen |
-| `deepseek-v4.1-flash-free` | **6,0 s** ⚡ | Modèle polyvalent DeepSeek V4.1, analyse & synthèse | 🟢 Gratuit Zen |
-| ⭐ `glm-5.3-flash-free` | 11,3 s | **Frontière de pointe** — qualité supérieure pour le code et le raisonnement | 🟢 Gratuit Zen |
-| 🔄 `frontier-robin-free` | *Dynamique* | **Pseudo-modèle maître** — équilibrage de charge tournant sur les 3 frontières | 🟣 Master Load-Balancer |
+| 🆕 `beam-free` | **5,3 s** ⚡ | **1M de contexte**, 131K output, raisonnement + tool calling — le plus rapide des 4 | 🟢 Gratuit (durée limitée) |
+| `space-bunny-free` | **5,7 s** ⚡ | Le sprinter ultra-rapide pour questions courtes et chat | 🟢 Gratuit Zen |
+| `deepseek-v4.1-flash-free` | **9,0 s** | Modèle polyvalent DeepSeek V4.1, analyse & synthèse | 🟢 Gratuit Zen |
+| ⭐ `glm-5.3-flash-free` | 6,4 s | **Frontière de pointe** — qualité supérieure pour le code et le raisonnement | 🟢 Gratuit Zen |
+| 🔄 `frontier-robin-free` | *Dynamique* | **Pseudo-modèle maître** — équilibrage de charge tournant sur les 4 frontières | 🟣 Master Load-Balancer |
 
 > **Ordre de cascade en mode priorité :**  
-> `glm-5.3-flash-free` ➔ `space-bunny-free` ➔ `deepseek-v4.1-flash-free`.  
-> Le modèle demandé explicitement passe toujours en premier ; `frontier-robin-free` route sur les trois en rotation continue.
+> `beam-free` ➔ `glm-5.3-flash-free` ➔ `space-bunny-free` ➔ `deepseek-v4.1-flash-free`.  
+> Le modèle demandé explicitement passe toujours en premier ; `frontier-robin-free` route sur les quatre en rotation continue.
 
 ---
 
@@ -97,7 +98,7 @@ Impossible d'appeler l'API en direct avec un simple `curl` ou un client OpenAI s
 | Endpoint | Méthode | Description |
 |---|---|---|
 | `/health` | `GET` | État vivant, version compilée et requêtes in-flight |
-| `/v1/models` | `GET` | Liste des modèles disponibles (`frontier-robin-free` + les 3 frontières) |
+| `/v1/models` | `GET` | Liste des modèles disponibles (`frontier-robin-free` + les 4 frontières) |
 | `/v1/chat/completions` | `POST` | Chat standard (cascade/mode automatique) |
 | `/admin/stats` | `GET` | Métriques d'usage, état de santé, statistiques anti-spam, mode actif |
 | `/admin/mode` | `GET` / `POST` | Consultation et bascule à chaud du mode de routage (`priority` / `roundrobin`) |
@@ -145,6 +146,7 @@ custom_providers:
   api_mode: chat_completions
   models:
     frontier-robin-free: {}
+    beam-free: {}
     glm-5.3-flash-free: {}
     space-bunny-free: {}
     deepseek-v4.1-flash-free: {}

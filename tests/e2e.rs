@@ -4,6 +4,7 @@
 //! (tmpdir propre, port 0) : aucune variable d'env process, aucune
 //! race inter-tests, aucun état partagé hors du serveur testé.
 
+use pauvre_router::models::FREE_MODELS;
 use pauvre_router::server::{self, ServerConfig};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -200,8 +201,9 @@ fn e2e_health_et_models() {
         .iter()
         .filter_map(|m| m["id"].as_str())
         .collect();
-    assert_eq!(ids.len(), 4, "robin + 3 frontieres: {ids:?}");
+    assert_eq!(ids.len(), 5, "robin + 4 frontieres: {ids:?}");
     assert!(ids.contains(&"frontier-robin-free"));
+    assert!(ids.contains(&"beam-free"));
     assert!(ids.contains(&"glm-5.3-flash-free"));
     assert!(ids.contains(&"space-bunny-free"));
     assert!(ids.contains(&"deepseek-v4.1-flash-free"));
@@ -281,16 +283,17 @@ fn e2e_chat_sse_stream() {
 #[test]
 fn e2e_robin_round_robin_prouve_la_repartition() {
     let i = start("robin", |_| {});
-    // 3 prompts distincts (pas de cache) sur le robin : la cascade entière
-    // est couverte par le round-robin → les 3 modèles répondent une fois.
+    // N prompts distincts (pas de cache) sur le robin : la cascade entière
+    // est couverte par le round-robin → chaque modèle répond une fois.
     let mut served: Vec<String> = Vec::new();
-    for n in 0..3 {
+    for n in 0..FREE_MODELS.len() {
         let (_, v) = chat(i.port, "frontier-robin-free", &format!("PONG {n}")).unwrap();
         let content = chat_content(&v);
         served.push(content);
     }
     let all = served.join(" | ");
     for m in [
+        "beam-free",
         "glm-5.3-flash-free",
         "space-bunny-free",
         "deepseek-v4.1-flash-free",
@@ -320,7 +323,9 @@ fn e2e_cascade_fallback_sur_quota() {
         .and_then(|r| r.split(": ").next())
         .unwrap_or_default();
     assert!(
-        fallback.ends_with("space-bunny-free") || fallback.ends_with("deepseek-v4.1-flash-free"),
+        fallback.ends_with("beam-free")
+            || fallback.ends_with("space-bunny-free")
+            || fallback.ends_with("deepseek-v4.1-flash-free"),
         "repondu par un modele de fallback, pas glm: '{served}'"
     );
     // le refus quota a bien mis glm en cooldown (health)
@@ -340,13 +345,14 @@ fn e2e_tous_en_cooldown_429() {
     let i = start("cooldown-all", |c| {
         c.backend_env = vec![(
             "STUB_FAIL".into(),
-            "glm-5.3-flash-free,space-bunny-free,deepseek-v4.1-flash-free".into(),
+            "beam-free,glm-5.3-flash-free,space-bunny-free,deepseek-v4.1-flash-free".into(),
         )];
     });
     let (code1, v1) = chat(i.port, "glm-5.3-flash-free", "PONG one").unwrap();
     assert_eq!(code1, 502, "toute la chaîne échoue: {v1}");
     let stats = get_json(i.port, "/admin/stats");
     for m in [
+        "beam-free",
         "glm-5.3-flash-free",
         "space-bunny-free",
         "deepseek-v4.1-flash-free",

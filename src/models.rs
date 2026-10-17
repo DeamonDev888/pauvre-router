@@ -11,9 +11,11 @@ pub const COOLDOWN_TRANSIENT: Duration = Duration::from_secs(10);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 
 /// Modèles frontière retenus (les meilleurs gratuits testés en live).
-/// ⭐ glm-5.3-flash-free : frontière, gratuit depuis oct 2026.
-/// space-bunny : le plus rapide (6 s). deepseek-v4.1-flash : 6 s aussi.
+/// beam-free : le plus rapide (5,3 s) + 1M contexte — gratuit pour une
+/// durée limitée. glm-5.3-flash-free : frontière, gratuit depuis oct 2026.
+/// space-bunny : 5,7 s. deepseek-v4.1-flash : 9 s.
 pub const FREE_MODELS: &[&str] = &[
+    "beam-free",
     "glm-5.3-flash-free",
     "space-bunny-free",
     "deepseek-v4.1-flash-free",
@@ -179,7 +181,7 @@ mod tests {
         reg.insert("space-bunny-free".into(), h);
         assert_eq!(
             pick(&c, &reg, now).unwrap(),
-            "glm-5.3-flash-free" // saute le premier en cooldown
+            "beam-free" // saute le premier en cooldown
         );
         // tous en cooldown => None
         for m in FREE_MODELS {

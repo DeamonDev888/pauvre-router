@@ -96,6 +96,7 @@ custom_providers:
   api_mode: chat_completions
   models:
     frontier-robin-free: {}
+    beam-free: {}
     glm-5.3-flash-free: {}
     space-bunny-free: {}
     deepseek-v4.1-flash-free: {}
@@ -107,7 +108,7 @@ Redémarrer le client après modification.
 
 ```bash
 curl -s http://127.0.0.1:4445/health          # {"status":"ok","router":"pauvre-router"}
-curl -s http://127.0.0.1:4445/v1/models       # frontier-robin-free + 3 frontières
+curl -s http://127.0.0.1:4445/v1/models       # frontier-robin-free + 4 frontières
 curl -s -X POST http://127.0.0.1:4445/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"frontier-robin-free","messages":[{"role":"user","content":"PING ?"}]}'
