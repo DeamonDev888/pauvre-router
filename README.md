@@ -1,5 +1,9 @@
 # Router des Pauvres 🗑️🚀
 
+<p align="center">
+  <img src="assets/banner.jpg" alt="Router des Pauvres" width="100%" />
+</p>
+
 Proxy local OpenAI-compat qui route vers les **modèles frontière gratuits** d'OpenCode Zen — pour ceux qui n'ont pas de budget API. Le « router des pauvres ».
 
 ## Pourquoi
@@ -79,6 +83,10 @@ custom_providers:
 ```
 
 ⚠️ La liste `models:` du `config.yaml` est **statique** : c'est elle que lit le picker de modèles d'Hermes. Nouveau modèle dans le router → l'ajouter aussi dans le config.
+
+Résultat dans le picker d'Hermes Desktop — le groupe **ZEN-FREE** avec les 4 modèles, sélection de `space-bunny-free` (contexte XHIGH) :
+
+![Modèles zen-free dans le picker Hermes Desktop](assets/hermes-picker.png)
 
 ## Plugin desktop Hermes
 
