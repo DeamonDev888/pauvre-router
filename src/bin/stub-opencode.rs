@@ -22,8 +22,15 @@ fn main() {
     let mut prompt = String::new();
     let _ = std::io::stdin().read_to_string(&mut prompt);
     let p = prompt.trim().to_string();
+    // le prompt compose contient [Règles du proxy]...[Question] ; le stub
+    // ne s'intéresse qu'à la question (compat des assertions E2E)
+    let q = p
+        .rsplit_once("[Question]\n")
+        .map(|(_, q)| q.trim())
+        .unwrap_or(&p)
+        .to_string();
 
-    if let Some(rest) = p.strip_prefix("SLOW ") {
+    if let Some(rest) = q.strip_prefix("SLOW ") {
         let ms: u64 = rest.trim().parse().unwrap_or(50);
         std::thread::sleep(std::time::Duration::from_millis(ms));
         println!("slow done {model}");
@@ -43,7 +50,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    if p.starts_with("ECHOKEY") {
+    if q.starts_with("ECHOKEY") {
         match std::env::var("OPENCODE_API_KEY") {
             Ok(k) if !k.is_empty() => println!("KEY={k} model={model}"),
             _ => println!("KEY=ANONYMOUS model={model}"),
@@ -51,5 +58,5 @@ fn main() {
         return;
     }
 
-    println!("ack {model}: {p}");
+    println!("ack {model}: {q}");
 }

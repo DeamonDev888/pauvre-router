@@ -94,7 +94,7 @@ Si un modèle tombe (quota, panne), le suivant prend le relais automatiquement. 
 
 Binaires Windows / Linux / macOS construits par GitHub Actions : **[Releases](../../releases)**.
 
-**84 tests** (unitaires + backend stub + E2E TCP), tous verts en dev et release — voir [CHANGELOG.md](CHANGELOG.md) pour l'historique.
+**86 tests** (unitaires + backend stub + E2E TCP), tous verts en dev et release — voir [CHANGELOG.md](CHANGELOG.md) pour l'historique.
 
 ---
 
