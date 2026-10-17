@@ -16,7 +16,9 @@ use crate::classify::{self, ErrorKind};
 use crate::guard::{Gate, RateLimiter};
 use crate::http::{HttpConn, HttpError, Request, MAX_CONN_AGE};
 use crate::keystore::{KeyChoice, KeyStore};
-use crate::models::{cascade, pick, pick_round_robin, Health, Registry, FREE_MODELS, ROBIN_MODEL};
+use crate::models::{
+    cascade, pick, pick_robin_smart, pick_round_robin, Health, Registry, FREE_MODELS, ROBIN_MODEL,
+};
 use crate::prompt::{compose_prompt, sanitize_model};
 use crate::stats::{save_to, Stats};
 use crate::update::Updater;
@@ -208,6 +210,8 @@ fn completion_body(text: &str, model: &str) -> serde_json::Value {
 /// Corps SSE (chat.completion.chunk) : le format que le client OpenAI
 /// attend en streaming. Sans ça, Hermes lit 0 chunk → EmptyStreamError
 /// → fallback provider. Rôle → contenu → fin → [DONE].
+/// Le texte est découpé en chunks ~240 chars (frontières lignes/space) :
+/// le client rend progressivement au lieu d'attendre la réponse entière.
 fn sse_body(text: &str, model: &str) -> String {
     let id = format!("chatcmpl-pauvre-{}-{}", std::process::id(), now_epoch());
     let created = now_epoch();
@@ -225,12 +229,44 @@ fn sse_body(text: &str, model: &str) -> String {
         serde_json::json!({"role": "assistant", "content": ""}),
         None,
     );
-    if !text.is_empty() {
-        out.push_str(&chunk(serde_json::json!({"content": text}), None));
+    for piece in split_stream_pieces(text) {
+        out.push_str(&chunk(serde_json::json!({"content": piece}), None));
     }
     out.push_str(&chunk(serde_json::json!({}), Some("stop")));
     out.push_str("data: [DONE]\n\n");
     out
+}
+
+/// Découpe en morceaux ≈240 chars, frontière = fin de ligne ou espace.
+/// Texte vide → aucun morceau (le rôle + stop suffisent).
+fn split_stream_pieces(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    while start < text.len() {
+        let end = (start + 240).min(text.len());
+        // chercher une frontière propre dans la fenêtre [end-120, end)
+        let cut = bytes[start..end]
+            .iter()
+            .rposition(|&b| b == b'\n' || b == b' ')
+            .filter(|&p| p > 120) // pas de morceau ridiculement court
+            .map(|p| start + p + 1)
+            .unwrap_or(end);
+        // ne jamais couper au milieu d'un caractère UTF-8
+        let mut cut = cut.min(text.len());
+        while cut > start && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if cut == start {
+            break;
+        }
+        pieces.push(text[start..cut].to_string());
+        start = cut;
+    }
+    pieces
 }
 
 /// Répond la complétion : SSE si le client a demandé stream:true
@@ -773,17 +809,27 @@ fn handle_chat(
     let mut last_err: Option<(serde_json::Value, u16)> = None;
     for _attempt in 0..chain.len() {
         let now = Instant::now();
-        let model = {
+        // (modèle, timeout effectif) : le robin intelligent renvoie un
+        // timeout adaptatif par modèle ; les autres chemins gardent la base
+        let (model, effective_timeout) = {
             let reg = shared.registry.lock().unwrap();
             let mode = shared.mode.lock().unwrap().clone();
-            let picked = if model_req == ROBIN_MODEL || mode == "roundrobin" {
-                let mut cur = shared.rr_cursor.lock().unwrap();
-                pick_round_robin(&chain, &reg, &mut cur, now)
+            let picked = if model_req == ROBIN_MODEL {
+                pick_robin_smart(
+                    &chain,
+                    &reg,
+                    &mut shared.rr_cursor.lock().unwrap(),
+                    now,
+                    shared.call_timeout,
+                )
+            } else if mode == "roundrobin" {
+                pick_round_robin(&chain, &reg, &mut shared.rr_cursor.lock().unwrap(), now)
+                    .map(|m| (m, shared.call_timeout))
             } else {
-                pick(&chain, &reg, now)
+                pick(&chain, &reg, now).map(|m| (m, shared.call_timeout))
             };
             match picked {
-                Some(m) => m,
+                Some(p) => p,
                 None => {
                     let b = err_body(
                         "tous les modeles frontieres sont en cooldown, reessaie plus tard",
@@ -815,7 +861,7 @@ fn handle_chat(
             &shared_backend_exe(shared),
             &model,
             &prompt,
-            shared.call_timeout,
+            effective_timeout,
             api_key,
             &shared.backend_env,
         ) {
@@ -1064,6 +1110,28 @@ pub fn serve(bound: BoundServer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_split_decoupe_et_recompose() {
+        let text = "ligne une\nligne deux\nligne trois avec pas mal de mots pour depasser la taille fenetre et verifier la coupure sur espace au milieu sinon on tronque au caractere pres sans jamais casser l utf8";
+        let pieces = split_stream_pieces(text);
+        assert!(pieces.len() >= 2, "doit decouper: {pieces:?}");
+        assert_eq!(pieces.join(""), text, "recomposition exacte");
+        for p in &pieces {
+            assert!(p.len() <= 240, "pas de morceau geant: {}", p.len());
+        }
+    }
+
+    #[test]
+    fn sse_split_utf8_et_vide() {
+        assert!(split_stream_pieces("").is_empty());
+        let e = "🦀".repeat(600);
+        let pieces = split_stream_pieces(&e);
+        assert_eq!(pieces.join(""), e, "jamais de coupure utf8");
+        for p in &pieces {
+            assert!(std::str::from_utf8(p.as_bytes()).is_ok());
+        }
+    }
 
     #[test]
     fn err_body_structure_et_retry_after() {

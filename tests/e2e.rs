@@ -284,25 +284,35 @@ fn e2e_chat_sse_stream() {
 }
 
 #[test]
-fn e2e_robin_round_robin_prouve_la_repartition() {
+fn e2e_robin_smart_exploite_le_rapide_et_explorre() {
     let i = start("robin", |_| {});
-    // N prompts distincts (pas de cache) sur le robin : la cascade entière
-    // est couverte par le round-robin → chaque modèle répond une fois.
+    // Robin INTELLIGENT : au boot tout est vierge (médiane 10 s pour tous)
+    // → l'exploitation prend le premier de la cascade (beam) ; l'exploration
+    // 1/5 fait découvrir les autres. Sur 8 requêtes (~1-2 explorations) :
+    // beam domine, et AU MOINS 1 autre modèle a servi (exploration).
+    let n = FREE_MODELS.len() + 4;
     let mut served: Vec<String> = Vec::new();
-    for n in 0..FREE_MODELS.len() {
-        let (_, v) = chat(i.port, "frontier-robin-free", &format!("PONG {n}")).unwrap();
+    for k in 0..n {
+        let (_, v) = chat(i.port, "frontier-robin-free", &format!("PONG {k}")).unwrap();
         let content = chat_content(&v);
-        served.push(content);
+        served.push(
+            content
+                .strip_prefix("ack opencode/")
+                .and_then(|r| r.split(": ").next())
+                .unwrap_or_default()
+                .to_string(),
+        );
     }
-    let all = served.join(" | ");
-    for m in [
-        "beam-free",
-        "glm-5.3-flash-free",
-        "space-bunny-free",
-        "deepseek-v4.1-flash-free",
-    ] {
-        assert!(all.contains(m), "robin n'a pas servi {m}: {all}");
-    }
+    let beam_wins = served.iter().filter(|m| m.ends_with("beam-free")).count();
+    let others = served.iter().filter(|m| !m.ends_with("beam-free")).count();
+    assert!(
+        beam_wins >= 4,
+        "l'exploitation doit dominer (beam, premier jamais vu): {served:?}"
+    );
+    assert!(
+        others >= 1,
+        "l'exploration 1/5 doit découvrir au moins 1 autre modèle: {served:?}"
+    );
 }
 
 // ---------------------------------------------------------------------

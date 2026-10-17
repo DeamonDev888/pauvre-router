@@ -34,7 +34,15 @@ pub struct Health {
     pub ok_count: u32,
     /// Dernière latence observée (ms).
     pub last_latency_ms: u64,
+    /// Latence EWMA (ms) — moyenne mobile exponentielle, alpha 1/4 :
+    /// lisse les pics tout en réagissant à ~4 requêtes. 0 = jamais vu.
+    pub ewma_latency_ms: f64,
+    /// Nombre de fois où ce modèle a dépassé SLOW_MS (pour le scoring).
+    pub slow_count: u32,
 }
+
+/// Au-delà de cette latence, un modèle est « lent » (compte dans le score).
+pub const SLOW_MS: u64 = 20_000;
 
 impl Health {
     pub fn available(&self, now: Instant) -> bool {
@@ -59,10 +67,33 @@ impl Health {
     }
 
     pub fn note_success(&mut self, latency: Duration) {
+        let ms = latency.as_millis() as f64;
+        // EWMA alpha=0.25 : 0 -> seed direct, sinon lissage
+        self.ewma_latency_ms = if self.ewma_latency_ms == 0.0 {
+            ms
+        } else {
+            self.ewma_latency_ms * 0.75 + ms * 0.25
+        };
+        self.last_latency_ms = latency.as_millis() as u64;
+        if self.last_latency_ms > SLOW_MS {
+            self.slow_count = self.slow_count.saturating_add(1);
+        }
         self.failures = 0;
         self.ok_count += 1;
         self.cooldown_until = None;
-        self.last_latency_ms = latency.as_millis() as u64;
+    }
+
+    /// Score de préférence : plus PETIT = meilleur.
+    /// EWMA de latence + 30 s par échec consécutif + 5 s par dépassement
+    /// lent. Les modèles jamais vus reçoivent la médiane des connus (ou
+    /// 10 s par défaut) : ils sont essayés mais ne dominent pas a priori.
+    pub fn score(&self, median_ms: f64) -> f64 {
+        let base = if self.ewma_latency_ms > 0.0 {
+            self.ewma_latency_ms
+        } else {
+            median_ms
+        };
+        base + self.failures as f64 * 30_000.0 + self.slow_count as f64 * 5_000.0
     }
 }
 
@@ -112,6 +143,93 @@ pub fn pick_round_robin(
     None
 }
 
+/// Médiane des latences EWMA connues (fallback 10 s si tout est vierge).
+fn median_known_latency(registry: &Registry, cascade: &[String]) -> f64 {
+    let mut v: Vec<f64> = cascade
+        .iter()
+        .filter_map(|m| registry.get(m))
+        .map(|h| h.ewma_latency_ms)
+        .filter(|x| *x > 0.0)
+        .collect();
+    if v.is_empty() {
+        return 10_000.0;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v[v.len() / 2]
+}
+
+/// Robin INTELLIGENT : exploite les scores (EWMA + pénalités) pour
+/// envoyer la requête au modèle le plus rapide fiable, tout en gardant
+/// une exploration déterministe (1 requête sur 5 part sur le meilleur
+/// score PAR le modèle suivant) pour rafraîchir les mesures — un modèle
+/// redevenu rapide est redétecté en ≤ 5 requêtes, un modèle dégradé est
+/// évité dès la suivante. Le curseur n'avance QUE sur l'exploration :
+/// l'exploitation peut frapper le même modèle plusieurs fois de suite.
+/// Retourne (modèle, timeout_effectif) — le timeout s'adapte à l'EWMA :
+/// rapide connu = coupe court, lent connu = marge élargie.
+pub fn pick_robin_smart(
+    cascade: &[String],
+    registry: &Registry,
+    exploration_cursor: &mut usize,
+    now: Instant,
+    base_timeout: Duration,
+) -> Option<(String, Duration)> {
+    let median = median_known_latency(registry, cascade);
+    let candidates: Vec<&String> = cascade
+        .iter()
+        .filter(|m| registry.get(*m).map(|h| h.available(now)).unwrap_or(true))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    // exploration 1/5 : la 5e requête (cursor % 5 == 4) part sur le
+    // suivant du curseur — garantit la fraîcheur des mesures
+    let explore = *exploration_cursor % 5 == 4;
+    *exploration_cursor = exploration_cursor.wrapping_add(1);
+    let chosen = if explore {
+        let idx = *exploration_cursor % candidates.len();
+        candidates[idx].clone()
+    } else {
+        // exploitation : min score (tie-break : ordre de cascade)
+        candidates
+            .iter()
+            .enumerate()
+            .min_by(|(i, a), (j, b)| {
+                let sa = registry
+                    .get(a.as_str())
+                    .map(|h| h.score(median))
+                    .unwrap_or(median);
+                let sb = registry
+                    .get(b.as_str())
+                    .map(|h| h.score(median))
+                    .unwrap_or(median);
+                sa.partial_cmp(&sb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(i.cmp(j))
+            })
+            .map(|(_, m)| (*m).clone())
+            .unwrap_or_else(|| candidates[0].clone())
+    };
+    // timeout adaptatif : 1,5× EWMA — borné [30 s, base] en prod ; si
+    // base < 30 s (config de test), borné [base/3, base]. clamp(min>max)
+    // panique : min est toujours <= max ici.
+    let ewma = registry
+        .get(&chosen)
+        .map(|h| h.ewma_latency_ms)
+        .unwrap_or(0.0);
+    let adaptive = if ewma > 0.0 {
+        let want = Duration::from_millis((ewma * 1.5) as u64);
+        if base_timeout >= Duration::from_secs(30) {
+            want.clamp(Duration::from_secs(30), base_timeout)
+        } else {
+            want.clamp(base_timeout / 3, base_timeout)
+        }
+    } else {
+        base_timeout
+    };
+    Some((chosen, adaptive))
+}
+
 /// Sérialise l'état de santé d'un modèle pour le dump JSON.
 pub fn health_json(h: &Health, now: Instant) -> serde_json::Value {
     serde_json::json!({
@@ -123,12 +241,115 @@ pub fn health_json(h: &Health, now: Instant) -> serde_json::Value {
         "failures": h.failures,
         "ok": h.ok_count,
         "last_latency_ms": h.last_latency_ms,
+        "ewma_latency_ms": h.ewma_latency_ms as u64,
+        "slow_count": h.slow_count,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn h_ok(lat_ms: u64) -> Health {
+        let mut h = Health::default();
+        h.note_success(Duration::from_millis(lat_ms));
+        h
+    }
+
+    #[test]
+    fn ewma_lisse_et_reagit() {
+        let mut h = Health::default();
+        h.note_success(Duration::from_millis(4000));
+        assert_eq!(h.ewma_latency_ms, 4000.0); // seed
+        h.note_success(Duration::from_millis(8000));
+        // 4000*0.75 + 8000*0.25 = 5000
+        assert_eq!(h.ewma_latency_ms, 5000.0);
+        h.note_success(Duration::from_millis(8000));
+        assert_eq!(h.ewma_latency_ms, 5750.0); // 5000*.75+8000*.25
+    }
+
+    #[test]
+    fn score_penalise_echecs_et_lenteur() {
+        let rapide = h_ok(5000);
+        let mut lent = h_ok(30000); // slow_count=1 (30s > 20s)
+        lent.slow_count = 2;
+        let mut casse = Health::default();
+        casse.note_success(Duration::from_millis(5000));
+        casse.note_failure(ErrorKind::Transient, Instant::now()); // failures=1
+        let m = 10000.0;
+        assert!(rapide.score(m) < casse.score(m), "cassé doit scorer pire");
+        assert!(rapide.score(m) < lent.score(m), "lent doit scorer pire");
+    }
+
+    #[test]
+    fn jamais_vu_recueit_la_mediane() {
+        let mut reg: Registry = HashMap::new();
+        reg.insert("a".into(), h_ok(4000));
+        // b jamais vu
+        let median = median_known_latency(&reg, &["a".into(), "b".into()]);
+        assert_eq!(median, 4000.0);
+        let h = Health::default();
+        assert_eq!(h.score(median), 4000.0); // b = médiane, ni mieux ni pire
+    }
+
+    #[test]
+    fn robin_smart_exploite_le_plus_rapide() {
+        let now = Instant::now();
+        let mut reg: Registry = HashMap::new();
+        reg.insert("beam-free".into(), h_ok(5000));
+        reg.insert("glm-5.3-flash-free".into(), h_ok(25000)); // slow
+        reg.insert("space-bunny-free".into(), h_ok(5700));
+        reg.insert("deepseek-v4.1-flash-free".into(), h_ok(9000));
+        let chain: Vec<String> = FREE_MODELS.iter().map(|m| m.to_string()).collect();
+        let mut cursor = 0usize;
+        // 4 exploitations consécutives (pas d'exploration aux idx 0-3) :
+        // toutes doivent tomber sur beam (score min)
+        for _ in 0..4 {
+            let (m, t) =
+                pick_robin_smart(&chain, &reg, &mut cursor, now, Duration::from_secs(80)).unwrap();
+            assert_eq!(m, "beam-free");
+            // timeout adaptatif : 1,5× 5000 = 7,5 s, borné bas à 30 s
+            assert_eq!(t, Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn robin_smart_degrade_le_lent_dans_le_timeout() {
+        let now = Instant::now();
+        let mut reg: Registry = HashMap::new();
+        reg.insert("beam-free".into(), h_ok(5000));
+        let mut slow = h_ok(40000); // > SLOW_MS
+        slow.slow_count = 1;
+        reg.insert("glm-5.3-flash-free".into(), slow);
+        let chain = vec!["beam-free".to_string(), "glm-5.3-flash-free".to_string()];
+        let mut cursor = 0usize;
+        // exploration (cursor 4e appel) peut tomber sur glm → timeout
+        // adaptatif = 1,5× 40 s = 60 s, pas 80 s (base) ni 30 s (min)
+        let mut saw_adaptive = false;
+        for _ in 0..5 {
+            let (m, t) =
+                pick_robin_smart(&chain, &reg, &mut cursor, now, Duration::from_secs(80)).unwrap();
+            if m == "glm-5.3-flash-free" {
+                assert_eq!(t, Duration::from_secs(60), "1,5× EWMA 40s = 60s");
+                saw_adaptive = true;
+            }
+        }
+        assert!(saw_adaptive, "l'exploration doit passer par glm (1/5)");
+    }
+
+    #[test]
+    fn robin_smart_tout_en_cooldown_none() {
+        let now = Instant::now();
+        let mut reg: Registry = HashMap::new();
+        let mut h = Health::default();
+        h.note_failure(ErrorKind::Exhausted, now);
+        reg.insert("beam-free".into(), h);
+        let chain = vec!["beam-free".to_string()];
+        let mut cursor = 0usize;
+        assert!(
+            pick_robin_smart(&chain, &reg, &mut cursor, now, Duration::from_secs(80)).is_none()
+        );
+    }
 
     #[test]
     fn cascade_demande_dabord_puis_frontiere() {

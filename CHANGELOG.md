@@ -3,6 +3,18 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.7.0] — 2026-10-17
+
+### Ajouté
+- **Robin intelligent** (`pick_robin_smart`) : le round-robin aveugle devient un sélecteur par score —
+  - **EWMA de latence** par modèle (alpha 1/4) : lisse les pics, réagit en ~4 requêtes ;
+  - **score** = EWMA + 30 s/échec consécutif + 5 s/dépassement de 20 s — un modèle dégradé est évité dès la requête suivante ;
+  - **exploration 1/5** : une requête sur cinq part sur le modèle suivant pour rafraîchir les mesures (un modèle redevenu rapide est redétecté en ≤ 5 requêtes) ;
+  - **timeout adaptatif** par modèle (1,5× EWMA, borné [30 s, base]) — un modèle lent connu a une vraie marge, un rapide est coupé tôt pour déclencher le fallback vite ;
+  - `/admin/stats` expose désormais `ewma_latency_ms` et `slow_count` par modèle.
+- **SSE multi-chunks** : les réponses sont découpées en chunks ~240 chars (frontières ligne/espace, UTF-8 safe) — les clients rendent progressivement au lieu d'attendre le bloc entier.
+- +11 tests (84 total) : EWMA, score, exploitation/exploration, timeout adaptatif, découpe SSE (UTF-8 inclus).
+
 ## [0.6.1] — 2026-10-17
 
 ### Corrigé
@@ -67,6 +79,7 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — s�
 - Rewrite Rust (std-only, binaire ~650 KB) : anti-spam token bucket, détection d'exhaustion + cooldowns à backoff exponentiel, cascade de fallback, cache de déduplication, rotation de clés API avec fallback anonyme (jamais de mix), modes `priority`/`roundrobin` à chaud, dashboard `/admin/stats`.
 - Workflow GitHub Actions : binaires Windows/Linux/macOS (Intel + Apple Silicon) à chaque tag.
 
+[0.7.0]: https://github.com/DeamonDev888/pauvre-router/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/DeamonDev888/pauvre-router/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/DeamonDev888/pauvre-router/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/DeamonDev888/pauvre-router/compare/v0.5.0...v0.5.1
