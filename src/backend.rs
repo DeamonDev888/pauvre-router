@@ -89,21 +89,47 @@ pub fn call_at(
         drop(si);
     }
 
+    // DRAINER stdout/stderr en threads pendant l'attente : sans ça, une
+    // réponse longue remplit le buffer du pipe (quelques Ko), l'enfant
+    // BLOQUE en écriture, ne termine jamais — deadlock jusqu'au timeout.
+    // (vu en prod : in_flight collé, 19 erreurs, latences 23 s+)
+    use std::io::Read;
+    use std::sync::mpsc;
+    let (tx_out, rx_out) = mpsc::channel();
+    let (tx_err, rx_err) = mpsc::channel();
+    if let Some(o) = child.stdout.take() {
+        std::thread::Builder::new()
+            .name("pauvre-drain-stdout".into())
+            .spawn(move || {
+                let mut s = String::new();
+                let _ = Read::read_to_string(&mut { o }, &mut s);
+                let _ = tx_out.send(s);
+            })
+            .ok();
+    }
+    if let Some(e) = child.stderr.take() {
+        std::thread::Builder::new()
+            .name("pauvre-drain-stderr".into())
+            .spawn(move || {
+                let mut s = String::new();
+                let _ = Read::read_to_string(&mut { e }, &mut s);
+                let _ = tx_err.send(s);
+            })
+            .ok();
+    }
+
     let deadline = Instant::now() + timeout;
-    // lecture bloquante avec veille de dépassement : wait + check périodique
+    // attente avec deadline : le drain se fait en parallèle, plus de deadlock
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut out = String::new();
-                if let Some(mut o) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = o.read_to_string(&mut out);
-                }
-                let mut err = String::new();
-                if let Some(mut e) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = e.read_to_string(&mut err);
-                }
+                // les threads de drain terminent naturellement après l'exit
+                let out = rx_out
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_default();
+                let err = rx_err
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_default();
                 let elapsed = timeout.saturating_sub(deadline - Instant::now());
                 if status.success() {
                     let text = strip_banner(&out);
