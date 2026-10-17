@@ -10,17 +10,19 @@ pub const COOLDOWN_MODEL_INVALID: Duration = Duration::from_secs(3600); // quasi
 pub const COOLDOWN_TRANSIENT: Duration = Duration::from_secs(10);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 
-/// Modèles gratuits frontière, ordre de cascade (qualité perçue décroissante).
-/// ⭐ glm-5.3-flash-free : frontière, gratuit depuis oct 2026 (testé OK 15,5 s).
-/// space-bunny : le plus rapide (2-4 s). nemotron-3-ultra : écarté (timeout >100 s).
+/// Modèles frontière retenus (les meilleurs gratuits testés en live).
+/// ⭐ glm-5.3-flash-free : frontière, gratuit depuis oct 2026.
+/// space-bunny : le plus rapide (6 s). deepseek-v4.1-flash : 6 s aussi.
 pub const FREE_MODELS: &[&str] = &[
     "glm-5.3-flash-free",
     "space-bunny-free",
-    "mimo-v2.6-flash-free",
     "deepseek-v4.1-flash-free",
-    "nemotron-3.5-lightning-free",
-    "longcat-2.5-preview-free",
 ];
+
+/// Pseudo-modèle exposé aux clients : round-robin permanent sur les
+/// frontières. Chaque requête part sur le modèle suivant — répartition
+/// de charge maximale, indépendant du mode global.
+pub const ROBIN_MODEL: &str = "frontier-robin-free";
 
 /// État de santé d'un modèle.
 #[derive(Debug, Clone, Default)]
@@ -65,8 +67,12 @@ impl Health {
 /// Registre partagé (verrouillé par le serveur, pas de Mutex interne ici).
 pub type Registry = HashMap<String, Health>;
 
-/// La cascade : modèle demandé en premier, puis les frontière libres.
+/// La cascade : modèle demandé en premier, puis les frontières.
+/// Le pseudo-modèle `frontier-robin-free` route sur TOUTE la cascade.
 pub fn cascade(requested: &str) -> Vec<String> {
+    if requested == ROBIN_MODEL {
+        return FREE_MODELS.iter().map(|m| (*m).to_string()).collect();
+    }
     let mut out = vec![requested.to_string()];
     for m in FREE_MODELS {
         if *m != requested && !out.iter().any(|x| x == m) {
@@ -124,9 +130,9 @@ mod tests {
 
     #[test]
     fn cascade_demande_dabord_puis_frontiere() {
-        let c = cascade("mimo-v2.6-flash-free");
-        assert_eq!(c[0], "mimo-v2.6-flash-free");
-        assert!(c.contains(&"space-bunny-free".to_string()));
+        let c = cascade("space-bunny-free");
+        assert_eq!(c[0], "space-bunny-free");
+        assert!(c.contains(&"glm-5.3-flash-free".to_string()));
         assert_eq!(c.len(), FREE_MODELS.len()); // pas de doublon
         let c2 = cascade("inconnu-xyz");
         assert_eq!(c2[0], "inconnu-xyz");
@@ -206,6 +212,20 @@ mod tests {
         let mut idx2 = 1usize;
         let next = pick_round_robin(&c, &reg2, &mut idx2, now).unwrap();
         assert_ne!(next, "glm-5.3-flash-free");
+    }
+
+    #[test]
+    fn robin_route_sur_toutes_les_frontieres() {
+        let c = cascade("frontier-robin-free");
+        assert_eq!(
+            c,
+            FREE_MODELS
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>()
+        );
+        // sanity : robin est bien le pseudo-modèle déclaré
+        assert_eq!(ROBIN_MODEL, "frontier-robin-free");
     }
 
     #[test]

@@ -11,7 +11,9 @@ use pauvre_router::classify::{self, ErrorKind};
 use pauvre_router::guard::{Gate, RateLimiter};
 use pauvre_router::http::{read_request, write_response, HttpError, Request};
 use pauvre_router::keystore::{KeyChoice, KeyStore};
-use pauvre_router::models::{cascade, pick, pick_round_robin, Health, Registry, FREE_MODELS};
+use pauvre_router::models::{
+    cascade, pick, pick_round_robin, Health, Registry, FREE_MODELS, ROBIN_MODEL,
+};
 use pauvre_router::prompt::{compose_prompt, sanitize_model};
 use pauvre_router::stats::{save, Stats};
 use pauvre_router::VERSION;
@@ -151,10 +153,16 @@ fn handle_client(stream: TcpStream, shared: &Arc<Shared>) {
         return;
     }
     if req.method == "GET" && (path == "/v1/models" || path == "/models") {
-        let models: Vec<_> = FREE_MODELS
-            .iter()
-            .map(|m| serde_json::json!({"id": m, "object": "model"}))
-            .collect();
+        let mut models: Vec<_> = vec![serde_json::json!({
+            "id": ROBIN_MODEL,
+            "object": "model",
+            "description": "round-robin permanent sur les modeles frontieres",
+        })];
+        models.extend(
+            FREE_MODELS
+                .iter()
+                .map(|m| serde_json::json!({"id": m, "object": "model"})),
+        );
         let body = serde_json::json!({"object": "list", "data": models});
         let _ = write_response(
             &mut writer,
