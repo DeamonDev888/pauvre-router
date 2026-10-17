@@ -1,4 +1,4 @@
-# Router des Pauvres 🗑️🚀
+# Le Router des Pauvres 🗑️🚀
 
 <p align="center">
   <img src="assets/banner.jpg" alt="Router des Pauvres 🗑️🚀" width="100%" />
@@ -8,12 +8,12 @@
   <a href="#-fonctionnalités-clés"><img src="https://img.shields.io/badge/Rust-std--only-f97316?style=for-the-badge&logo=rust&logoColor=white" alt="Rust std-only" /></a>
   <a href="#-fonctionnalités-clés"><img src="https://img.shields.io/badge/Taille-~650_KB-3b82f6?style=for-the-badge&logo=cargo&logoColor=white" alt="Binaire 650KB" /></a>
   <a href="#-modèles-frontière-gratuits--matrice-comparative"><img src="https://img.shields.io/badge/Budget_API-0_€_(100%25_Gratuit)-10b981?style=for-the-badge&logo=free&logoColor=white" alt="100% Gratuit" /></a>
-  <a href="#-endpoints-http"><img src="https://img.shields.io/badge/OpenAI-Compatible-8b5cf6?style=for-the-badge&logo=openai&logoColor=white" alt="OpenAI Compatible" /></a>
+  <a href="#-endpoints-http"><img src="https://img.shields.io/badge/Endpoints-Standard-8b5cf6?style=for-the-badge&logo=http&logoColor=white" alt="Endpoints Standard" /></a>
   <a href="#-modèles-frontière-gratuits--matrice-comparative"><img src="https://img.shields.io/badge/Modèles-3_Frontières-ec4899?style=for-the-badge" alt="3 Modèles Frontière" /></a>
   <a href="#-licence"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT" /></a>
 </p>
 
-> **Le proxy local OpenAI-compat qui route vers les modèles frontière gratuits d'OpenCode Zen** — pour tous ceux qui refusent de payer des abonnements et n'ont aucun budget API.
+> **Le proxy local qui route vers les modèles frontière gratuits d'OpenCode Zen** — pour tous ceux qui refusent de payer des abonnements, n'ont aucun budget API et veulent lancer des dizaines d'agents.
 
 ---
 
@@ -35,42 +35,6 @@ Impossible d'appeler l'API en direct avec un simple `curl` ou un client OpenAI s
   <img src="assets/architecture.svg" alt="Architecture & Request Flow" width="100%" />
 </p>
 
-### 🔄 Séquence d'une Requête
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Client as Client (Hermes, IDE, curl)
-    participant Router as pauvre-router (Rust std-only)
-    participant Cache as Cache Dédup (SHA-256)
-    participant Rate as Token Bucket (Anti-Spam)
-    participant Pool as Pool de Clés (Auto-Rotate)
-    participant Gate as opencode run (Gate Bypass)
-    participant Zen as OpenCode Zen (Free Frontier)
-
-    Client->>Router: POST /v1/chat/completions
-    Router->>Cache: Calcul du SHA-256 du prompt
-    alt Cache Hit (0 ms)
-        Cache-->>Client: Réponse immédiate depuis la RAM
-    else Cache Miss
-        Router->>Rate: Consommation de jeton (IP)
-        Router->>Pool: Sélectionne la clé active courante
-        Router->>Gate: Spawne 'opencode run <modèle>' (TLS fingerprint valide)
-        Gate->>Zen: Envoie payload authentifié
-        alt Succès 200 OK
-            Zen-->>Gate: Tokens streamés
-            Gate-->>Router: Réponse complète
-            Router->>Cache: Enregistre dans le LRU (TTL 10 min)
-            Router-->>Client: 200 OK (OpenAI-compat JSON)
-        else Erreur Quota 429
-            Gate-->>Router: Quota épuisé
-            Router->>Pool: Quarantaine (30 min) + Bascule clé suivante
-            Router->>Gate: Relance automatique (ou fallback anonyme)
-            Gate-->>Client: Réponse réussie sans coupure
-        end
-    end
-```
-
 ---
 
 ## ✨ Fonctionnalités Clés
@@ -79,7 +43,7 @@ sequenceDiagram
   <img src="assets/features-grid.svg" alt="Fonctionnalités Clés" width="100%" />
 </p>
 
-- **OpenAI-compat** : `POST /v1/chat/completions`, `GET /v1/models` — branche n'importe quel client (Hermes, scripts, curl, Continue.dev, VSCode…)
+- **Standard** : `POST /v1/chat/completions`, `GET /v1/models` — branche n'importe quel client (Hermes, scripts, curl, Continue.dev, VSCode…)
 - **⭐ GLM 5.3 Flash gratuit** en tête de cascade (qualité frontière, testé en live)
 - **`frontier-robin-free`** — notre pseudo-modèle **round-robin permanent** : chaque requête tourne sur les frontières (`glm` → `space-bunny` → `deepseek` → `glm` → …). La répartition de charge en un seul identifiant de modèle.
 - **2 modes de routage** (switch à chaud via `/admin/mode`) :
@@ -134,7 +98,7 @@ sequenceDiagram
 |---|---|---|
 | `/health` | `GET` | État vivant, version compilée et requêtes in-flight |
 | `/v1/models` | `GET` | Liste des modèles disponibles (`frontier-robin-free` + les 3 frontières) |
-| `/v1/chat/completions` | `POST` | Chat standard OpenAI-compatible (cascade/mode automatique) |
+| `/v1/chat/completions` | `POST` | Chat standard (cascade/mode automatique) |
 | `/admin/stats` | `GET` | Métriques d'usage, état de santé, statistiques anti-spam, mode actif |
 | `/admin/mode` | `GET` / `POST` | Consultation et bascule à chaud du mode de routage (`priority` / `roundrobin`) |
 | `/admin/keys` | `GET` | Métadonnées du pool de clés (clés masquées pour sécurité) |
