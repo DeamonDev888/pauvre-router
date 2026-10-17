@@ -6,6 +6,9 @@
 
 use pauvre_router::models::FREE_MODELS;
 use pauvre_router::server::{self, ServerConfig};
+/// Version du crate, injectée à la compilation (les tests valident les
+/// endpoints contre la VRAIE version, pas une constante copiée).
+use pauvre_router::VERSION as VERSION_PROD;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -655,6 +658,33 @@ fn e2e_corps_trop_grand_413() {
             .unwrap_or(0);
         assert_eq!(code, 413, "réponse: {out}");
     }
+}
+
+#[test]
+fn e2e_update_endpoints() {
+    // GET /admin/update : état initial (jamais checké → latest null)
+    let i = start("update", |_| {});
+    let u = get_json(i.port, "/admin/update");
+    assert_eq!(u["current"], VERSION_PROD, "u={u}");
+    assert_eq!(u["update_available"], false);
+    // le champ url existe (pointe vers releases/latest)
+    assert!(
+        u["url"].as_str().unwrap_or_default().contains("releases"),
+        "u={u}"
+    );
+    // /health expose le bloc update (contract Hermes/plugin)
+    let (_, raw) = req(i.port, "GET", "/health", b"", false).unwrap();
+    assert!(raw.contains("\"update\""), "health sans bloc update: {raw}");
+    // /admin/stats aussi
+    let stats = get_json(i.port, "/admin/stats");
+    assert!(
+        stats["update"]["available"].is_boolean(),
+        "stats sans update: {stats}"
+    );
+    // POST /admin/update/check : check réel réseau — tolérant (peut
+    // échouer en sandbox CI sans sortie) mais ne doit JAMAIS 500
+    let (code, _) = req(i.port, "POST", "/admin/update/check", b"", false).unwrap();
+    assert_eq!(code, 200, "check forcé doit répondre 200 même réseau KO");
 }
 
 #[test]

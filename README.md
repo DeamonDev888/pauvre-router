@@ -174,7 +174,7 @@ Consultez la page **[Releases](../../releases)** pour télécharger les binaires
 
 ## 🧪 Tests
 
-**73 tests** (49 unitaires + 6 backend stub + 18 E2E), tous verts en `cargo test` comme en `cargo test --release` :
+**76 tests** (51 unitaires + 6 backend stub + 19 E2E), tous verts en `cargo test` comme en `cargo test --release` :
 
 - **E2E** (`tests/e2e.rs`) : de vrais serveurs démarrent sur des ports éphémères (mêmes workers que la prod) et parlent TCP pour de vrai — un stub `opencode` (`src/bin/stub-opencode.rs`, piloté par env `STUB_FAIL`) remplace le CLI réel. Couverture : cascade de fallback, cooldowns, 429 tous-cooldowns, anti-spam token bucket, SSE streaming, cache, rotation de clés prouvée côté spawn, timeout backend, keep-alive, 413, persistance de l'état sur reboot, 12 requêtes concurrentes.
 

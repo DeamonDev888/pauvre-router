@@ -3,6 +3,16 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.6.0] — 2026-10-17
+
+### Ajouté
+- **Module de détection de mise à jour** (`src/update.rs`) :
+  - check GitHub Releases au boot puis toutes les heures (curl 6 s max, jamais bloquant, ne panic jamais) ;
+  - comparaison semver maison (tags non conformes ignorés) ;
+  - **`GET /admin/update`** : dernier état connu (current / latest / update_available / url) ;
+  - **`POST /admin/update/check`** : check forcé à la demande (répond toujours 200, même réseau KO) ;
+  - **`GET /health` et `/admin/stats`** exposent maintenant un bloc `update` — n'importe quel client (plugin desktop, scripts) voit `update.available: true` et l'URL de téléchargement dès qu'une release plus récente existe. Le téléchargement reste un choix de l'opérateur : le router signale, ne s'auto-remplace pas.
+
 ## [0.5.1] — 2026-10-17
 
 ### Corrigé
@@ -52,6 +62,7 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — s�
 - Rewrite Rust (std-only, binaire ~650 KB) : anti-spam token bucket, détection d'exhaustion + cooldowns à backoff exponentiel, cascade de fallback, cache de déduplication, rotation de clés API avec fallback anonyme (jamais de mix), modes `priority`/`roundrobin` à chaud, dashboard `/admin/stats`.
 - Workflow GitHub Actions : binaires Windows/Linux/macOS (Intel + Apple Silicon) à chaque tag.
 
+[0.6.0]: https://github.com/DeamonDev888/pauvre-router/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/DeamonDev888/pauvre-router/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/DeamonDev888/pauvre-router/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/DeamonDev888/pauvre-router/compare/v0.3.3...v0.4.0

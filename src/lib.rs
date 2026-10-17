@@ -18,6 +18,7 @@ pub mod models;
 pub mod prompt;
 pub mod server;
 pub mod stats;
+pub mod update;
 
 /// Version du crate (affichée dans /health et /admin/stats).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

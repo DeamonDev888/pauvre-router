@@ -19,6 +19,7 @@ use crate::keystore::{KeyChoice, KeyStore};
 use crate::models::{cascade, pick, pick_round_robin, Health, Registry, FREE_MODELS, ROBIN_MODEL};
 use crate::prompt::{compose_prompt, sanitize_model};
 use crate::stats::{save_to, Stats};
+use crate::update::Updater;
 use crate::VERSION;
 
 use std::collections::VecDeque;
@@ -106,6 +107,8 @@ pub struct Shared {
     pub call_timeout: Duration,
     /// Env additionnelle des spawns backend (figée au boot).
     pub backend_env: Vec<(String, String)>,
+    /// Détection de mise à jour (check au boot puis périodique).
+    pub updater: Arc<Updater>,
     /// Exe backend, figé au boot (one-shot : Some au boot, jamais muté).
     pub backend_exe_cell: Mutex<Option<String>>,
 }
@@ -128,6 +131,7 @@ impl Shared {
             call_timeout: cfg.call_timeout,
             backend_env: cfg.backend_env.clone(),
             backend_exe_cell: Mutex::new(Some(cfg.backend_exe.clone())),
+            updater: Arc::new(Updater::new(VERSION.to_string())),
         }
     }
 }
@@ -318,12 +322,18 @@ fn route_request(
 
     // ---- endpoints lecture ----
     if req.method == "GET" && (path == "/health" || path == "/v1/health") {
+        let upd = shared.updater.status();
         let body = serde_json::json!({
             "status": "ok",
             "router": "pauvre-router",
             "version": VERSION,
             "mode": shared.mode.lock().unwrap().clone(),
             "in_flight": shared.in_flight.load(Ordering::Relaxed),
+            "update": {
+                "available": upd.update_available,
+                "latest": upd.latest,
+                "url": upd.url,
+            },
         });
         let _ = conn.write_response(
             200,
@@ -359,6 +369,46 @@ fn route_request(
     }
     if req.method == "GET" && (path == "/admin/stats" || path == "/admin/health") {
         admin_stats(conn, shared, keep);
+        return;
+    }
+    // ---- mise à jour ----
+    if req.method == "GET" && path == "/admin/update" {
+        let upd = shared.updater.status();
+        let body = serde_json::json!({
+            "current": upd.current,
+            "latest": upd.latest,
+            "update_available": upd.update_available,
+            "url": upd.url,
+            "checked_at_epoch": upd.checked_at_epoch,
+        });
+        let _ = conn.write_response(
+            200,
+            "OK",
+            "application/json",
+            body.to_string().as_bytes(),
+            &[],
+            keep,
+        );
+        return;
+    }
+    if req.method == "POST" && path == "/admin/update/check" {
+        // check forcé (6 s max côté GitHub) — la réponse attend
+        let upd = shared.updater.check();
+        let body = serde_json::json!({
+            "current": upd.current,
+            "latest": upd.latest,
+            "update_available": upd.update_available,
+            "url": upd.url,
+            "checked_at_epoch": upd.checked_at_epoch,
+        });
+        let _ = conn.write_response(
+            200,
+            "OK",
+            "application/json",
+            body.to_string().as_bytes(),
+            &[],
+            keep,
+        );
         return;
     }
     if req.method == "POST" && (path == "/admin/cache/clear" || path == "/admin/reset") {
@@ -497,6 +547,7 @@ fn admin_stats(conn: &mut HttpConn, shared: &Arc<Shared>, keep: bool) {
     drop(spam);
     let keys_meta = shared.keystore.lock().unwrap().meta();
     let mode = shared.mode.lock().unwrap().clone();
+    let upd = shared.updater.status();
     let body = serde_json::json!({
         "version": VERSION,
         "stats": stats,
@@ -505,6 +556,12 @@ fn admin_stats(conn: &mut HttpConn, shared: &Arc<Shared>, keep: bool) {
         "keys": keys_meta,
         "mode": mode,
         "in_flight": shared.in_flight.load(Ordering::Relaxed),
+        "update": {
+            "available": upd.update_available,
+            "latest": upd.latest,
+            "url": upd.url,
+            "checked_at_epoch": upd.checked_at_epoch,
+        },
     });
     let _ = conn.write_response(
         200,
@@ -938,6 +995,9 @@ pub struct BoundServer {
 pub fn bind_server(cfg: &ServerConfig) -> std::io::Result<BoundServer> {
     let shared = Arc::new(Shared::new(cfg));
     load_state(&shared);
+
+    // détection de mise à jour : check au boot puis toutes les heures
+    shared.updater.spawn_periodic();
 
     // sauvegarde périodique (stats + santé + cooldowns de clés)
     {
