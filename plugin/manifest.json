@@ -1,7 +1,7 @@
 {
   "id": "pauvre-router",
   "name": "Router des Pauvres",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Monitoring du router des pauvres : santé des modèles gratuits Zen, cooldowns, stats, spam.",
   "entry": "plugin.js"
 }

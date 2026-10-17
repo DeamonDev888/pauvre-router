@@ -630,6 +630,12 @@ fn admin_keys(conn: &mut HttpConn, req: Request, path: &str, shared: &Arc<Shared
                 } else if ks.add(&key) {
                     let _ = ks.save();
                     (200, serde_json::json!({"added": true, "total": ks.count()}))
+                } else if crate::keystore::is_valid_key_format(&key) {
+                    // format valide mais déjà présent → rejeu RST idempotent
+                    (
+                        200,
+                        serde_json::json!({"added": false, "total": ks.count()}),
+                    )
                 } else {
                     (
                         400,
@@ -642,15 +648,16 @@ fn admin_keys(conn: &mut HttpConn, req: Request, path: &str, shared: &Arc<Shared
                 }
             }
             "remove" => {
-                if ks.remove(&key) {
+                // idempotent : un rejeu RST peut retomber sur une clé déjà
+                // supprimée — ce n'est pas une erreur, on répond 200 removed:false
+                let removed = ks.remove(&key);
+                if removed {
                     let _ = ks.save();
-                    (
-                        200,
-                        serde_json::json!({"removed": true, "total": ks.count()}),
-                    )
-                } else {
-                    (404, err_body("cle inconnue", "invalid_request_error", None))
                 }
+                (
+                    200,
+                    serde_json::json!({"removed": removed, "total": ks.count()}),
+                )
             }
             "reanimate" => {
                 if key.is_empty() {
