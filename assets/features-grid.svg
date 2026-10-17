@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 260" width="100%" height="100%">
+  <defs>
+    <linearGradient id="featBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0a0d14"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+
+    <linearGradient id="cardRust" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1f2937"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+  </defs>
+
+  <style>
+    .f-title { font-family: 'Segoe UI', -apple-system, sans-serif; font-size: 15px; font-weight: 700; fill: #f9fafb; }
+    .f-desc { font-family: 'Segoe UI', -apple-system, sans-serif; font-size: 11px; fill: #9ca3af; line-height: 1.4; }
+    .f-tag { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 9px; font-weight: bold; }
+    .f-icon { font-size: 20px; }
+  </style>
+
+  <rect x="1" y="1" width="958" height="258" rx="14" fill="url(#featBg)" stroke="#30363d" stroke-width="1.5"/>
+
+  <!-- GRID 3x2 -->
+
+  <!-- Card 1: Rust std-only -->
+  <g transform="translate(24, 20)">
+    <rect width="288" height="102" rx="10" fill="url(#cardRust)" stroke="#f97316" stroke-width="1.2"/>
+    <circle cx="30" cy="30" r="14" fill="#f97316" fill-opacity="0.2"/>
+    <text x="21" y="37" class="f-icon">🦀</text>
+    <text x="56" y="28" class="f-title">Rust std-only</text>
+    <rect x="56" y="36" width="90" height="15" rx="3" fill="#ea580c" fill-opacity="0.25"/>
+    <text x="60" y="47" class="f-tag" fill="#fb923c">650 KB • 0 DÉP</text>
+    <text x="16" y="74" class="f-desc">Zéro tokio, zéro reqwest. Démarrage instantané (&lt; 2 ms), empreinte mémoire ultra-minimale.</text>
+  </g>
+
+  <!-- Card 2: Cache Dédup -->
+  <g transform="translate(336, 20)">
+    <rect width="288" height="102" rx="10" fill="url(#cardRust)" stroke="#10b981" stroke-width="1.2"/>
+    <circle cx="30" cy="30" r="14" fill="#10b981" fill-opacity="0.2"/>
+    <text x="21" y="37" class="f-icon">⚡</text>
+    <text x="56" y="28" class="f-title">Cache Déduplication</text>
+    <rect x="56" y="36" width="96" height="15" rx="3" fill="#059669" fill-opacity="0.25"/>
+    <text x="60" y="47" class="f-tag" fill="#34d399">0 MS • SHA-256 LRU</text>
+    <text x="16" y="74" class="f-desc">Prompts identiques servis directement du cache mémoire. TTL 10 min, 128 entrées.</text>
+  </g>
+
+  <!-- Card 3: Anti-Spam Bucket -->
+  <g transform="translate(648, 20)">
+    <rect width="288" height="102" rx="10" fill="url(#cardRust)" stroke="#38bdf8" stroke-width="1.2"/>
+    <circle cx="30" cy="30" r="14" fill="#0284c7" fill-opacity="0.2"/>
+    <text x="21" y="37" class="f-icon">🛡️</text>
+    <text x="56" y="28" class="f-title">Bouclier Anti-Spam</text>
+    <rect x="56" y="36" width="102" height="15" rx="3" fill="#0284c7" fill-opacity="0.25"/>
+    <text x="60" y="47" class="f-tag" fill="#38bdf8">TOKEN BUCKET / IP</text>
+    <text x="16" y="74" class="f-desc">Rafale 5 max, 20 req/min. Plafond 3 process concurrents, limite body 1.5 Mo.</text>
+  </g>
+
+  <!-- Card 4: Frontier-Robin -->
+  <g transform="translate(24, 138)">
+    <rect width="288" height="102" rx="10" fill="url(#cardRust)" stroke="#ec4899" stroke-width="1.2"/>
+    <circle cx="30" cy="30" r="14" fill="#db2777" fill-opacity="0.2"/>
+    <text x="21" y="37" class="f-icon">🔄</text>
+    <text x="56" y="28" class="f-title">frontier-robin-free</text>
+    <rect x="56" y="36" width="116" height="15" rx="3" fill="#be185d" fill-opacity="0.25"/>
+    <text x="60" y="47" class="f-tag" fill="#f472b6">LOAD BALANCER AUTO</text>
+    <text x="16" y="74" class="f-desc">Pseudo-modèle permanent qui distribue vos requêtes à tour de rôle sur les 3 frontières.</text>
+  </g>
+
+  <!-- Card 5: Rotation de Clés -->
+  <g transform="translate(336, 138)">
+    <rect width="288" height="102" rx="10" fill="url(#cardRust)" stroke="#eab308" stroke-width="1.2"/>
+    <circle cx="30" cy="30" r="14" fill="#ca8a04" fill-opacity="0.2"/>
+    <text x="21" y="37" class="f-icon">🔑</text>
+    <text x="56" y="28" class="f-title">Rotation Résiliente</text>
+    <rect x="56" y="36" width="104" height="15" rx="3" fill="#a16207" fill-opacity="0.25"/>
+    <text x="60" y="47" class="f-tag" fill="#fde047">COOLDOWN &amp; ANONYME</text>
+    <text x="16" y="74" class="f-desc">Mise en quarantaine sur quota 429 (30 min). Fallback anonyme transparent si clés épuisées.</text>
+  </g>
+
+  <!-- Card 6: OpenAI & Admin API -->
+  <g transform="translate(648, 138)">
+    <rect width="288" height="102" rx="10" fill="url(#cardRust)" stroke="#a855f7" stroke-width="1.2"/>
+    <circle cx="30" cy="30" r="14" fill="#9333ea" fill-opacity="0.2"/>
+    <text x="21" y="37" class="f-icon">📊</text>
+    <text x="56" y="28" class="f-title">API Admin &amp; OpenAI</text>
+    <rect x="56" y="36" width="108" height="15" rx="3" fill="#7e22ce" fill-opacity="0.25"/>
+    <text x="60" y="47" class="f-tag" fill="#d8b4fe">ENDPOINTS STATS &amp; CHAT</text>
+    <text x="16" y="74" class="f-desc">Compatibilité totale /v1/chat/completions + endpoints /admin pour piloter le pool à chaud.</text>
+  </g>
+</svg>

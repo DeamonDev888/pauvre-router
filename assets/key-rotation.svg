@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 250" width="100%" height="100%">
+  <defs>
+    <linearGradient id="flowBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0a0d14"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+
+    <marker id="kArrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 8 5 L 0 9 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="kRedArrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 8 5 L 0 9 z" fill="#f87171"/>
+    </marker>
+    <marker id="kGreenArrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 8 5 L 0 9 z" fill="#34d399"/>
+    </marker>
+  </defs>
+
+  <style>
+    .k-title { font-family: 'Segoe UI', -apple-system, sans-serif; font-size: 16px; font-weight: 700; fill: #f3f4f6; }
+    .k-sub { font-family: 'Segoe UI', -apple-system, sans-serif; font-size: 12px; fill: #9ca3af; }
+    .k-label { font-family: 'Segoe UI', -apple-system, sans-serif; font-size: 13px; font-weight: 600; fill: #e5e7eb; }
+    .k-desc { font-family: 'Segoe UI', -apple-system, sans-serif; font-size: 10px; fill: #9ca3af; }
+    .k-badge { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 10px; font-weight: bold; }
+    .k-mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 10px; fill: #38bdf8; }
+  </style>
+
+  <!-- Container -->
+  <rect x="1" y="1" width="958" height="248" rx="14" fill="url(#flowBg)" stroke="#30363d" stroke-width="1.5"/>
+
+  <!-- Title -->
+  <text x="28" y="34" class="k-title">🔑 Cycle de Vie des Clés &amp; Résilience contre les Quotas</text>
+  <text x="28" y="52" class="k-sub">Rotation transparente • Cooldowns persistés sur disque • 0 interruption pour vos requêtes</text>
+
+  <!-- STEP 1: Incoming Request -->
+  <g transform="translate(28, 76)">
+    <rect width="130" height="140" rx="8" fill="#161b22" stroke="#38bdf8" stroke-width="1.2"/>
+    <rect x="10" y="10" width="30" height="18" rx="3" fill="#0284c7" fill-opacity="0.3"/>
+    <text x="17" y="23" class="k-badge" fill="#38bdf8">01</text>
+    <text x="10" y="46" class="k-label">Requête In</text>
+    <text x="10" y="66" class="k-desc">POST /v1/chat</text>
+    <text x="10" y="82" class="k-desc">Client tiers</text>
+    <rect x="10" y="106" width="110" height="20" rx="4" fill="#0f172a" stroke="#1e293b" stroke-width="1"/>
+    <text x="16" y="120" class="k-mono">In-Flight + 1</text>
+  </g>
+
+  <!-- Link 1 -> 2 -->
+  <path d="M 160 146 L 188 146" stroke="#38bdf8" stroke-width="2" marker-end="url(#kArrow)"/>
+
+  <!-- STEP 2: Key Pool Selection -->
+  <g transform="translate(192, 76)">
+    <rect width="180" height="140" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.2"/>
+    <rect x="10" y="10" width="30" height="18" rx="3" fill="#6366f1" fill-opacity="0.3"/>
+    <text x="17" y="23" class="k-badge" fill="#818cf8">02</text>
+    <text x="10" y="46" class="k-label">Pool de Clés Actives</text>
+    <text x="10" y="64" class="k-desc">Round-robin parmi clés saines</text>
+    
+    <g transform="translate(10, 76)">
+      <rect width="160" height="22" rx="4" fill="#1f2937"/>
+      <circle cx="12" cy="11" r="4" fill="#34d399"/>
+      <text x="22" y="15" class="k-mono">Key_A (Active)</text>
+    </g>
+    <g transform="translate(10, 104)">
+      <rect width="160" height="22" rx="4" fill="#1f2937"/>
+      <circle cx="12" cy="11" r="4" fill="#34d399"/>
+      <text x="22" y="15" class="k-mono">Key_B (Active)</text>
+    </g>
+  </g>
+
+  <!-- Link 2 -> 3 (On error/quota) -->
+  <path d="M 374 146 L 404 146" stroke="#f87171" stroke-width="2" marker-end="url(#kRedArrow)"/>
+  <rect x="375" y="126" width="28" height="14" rx="2" fill="#7f1d1d"/>
+  <text x="377" y="136" class="k-badge" fill="#fca5a5" font-size="8">429</text>
+
+  <!-- STEP 3: Cooldown & Quarantine -->
+  <g transform="translate(408, 76)">
+    <rect width="170" height="140" rx="8" fill="#161b22" stroke="#ef4444" stroke-width="1.2"/>
+    <rect x="10" y="10" width="30" height="18" rx="3" fill="#ef4444" fill-opacity="0.3"/>
+    <text x="17" y="23" class="k-badge" fill="#f87171">03</text>
+    <text x="10" y="46" class="k-label">Quarantaine Clé</text>
+    <text x="10" y="64" class="k-desc">Persisté ~/.keys.json</text>
+    
+    <rect x="10" y="74" width="150" height="24" rx="4" fill="#450a0a" stroke="#7f1d1d" stroke-width="1"/>
+    <text x="16" y="90" class="k-badge" fill="#fca5a5">COOLDOWN 30 MIN</text>
+
+    <text x="10" y="118" class="k-desc">Backoff exponentiel :</text>
+    <text x="10" y="130" class="k-mono" fill="#f87171">2m ➔ 5m ➔ 15m ➔ 1h</text>
+  </g>
+
+  <!-- Link 3 -> 4 -->
+  <path d="M 580 146 L 610 146" stroke="#38bdf8" stroke-width="2" marker-end="url(#kArrow)"/>
+
+  <!-- STEP 4: Next Key Switch -->
+  <g transform="translate(614, 76)">
+    <rect width="150" height="140" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.2"/>
+    <rect x="10" y="10" width="30" height="18" rx="3" fill="#eab308" fill-opacity="0.3"/>
+    <text x="17" y="23" class="k-badge" fill="#facc15">04</text>
+    <text x="10" y="46" class="k-label">Bascule Instantanée</text>
+    <text x="10" y="64" class="k-desc">Passe à la clé suivante</text>
+    <g transform="translate(10, 78)">
+      <rect width="130" height="24" rx="4" fill="#1f2937" stroke="#eab308" stroke-width="1"/>
+      <circle cx="12" cy="12" r="4" fill="#eab308"/>
+      <text x="22" y="16" class="k-mono" fill="#fde047">Key_C (Prend relais)</text>
+    </g>
+    <text x="10" y="124" class="k-desc">Transparence 100%</text>
+  </g>
+
+  <!-- Link 4 -> 5 -->
+  <path d="M 766 146 L 794 146" stroke="#34d399" stroke-width="2" marker-end="url(#kGreenArrow)"/>
+
+  <!-- STEP 5: Fallback Anonyme -->
+  <g transform="translate(798, 76)">
+    <rect width="136" height="140" rx="8" fill="#161b22" stroke="#10b981" stroke-width="1.2"/>
+    <rect x="10" y="10" width="30" height="18" rx="3" fill="#10b981" fill-opacity="0.3"/>
+    <text x="17" y="23" class="k-badge" fill="#34d399">05</text>
+    <text x="10" y="46" class="k-label">Fallback Zen</text>
+    <text x="10" y="64" class="k-desc">Si 0 clé dispo :</text>
+    <rect x="10" y="76" width="116" height="24" rx="4" fill="#064e3b" stroke="#047857" stroke-width="1"/>
+    <text x="14" y="92" class="k-badge" fill="#6ee7b7">MODE ANONYME</text>
+    <text x="10" y="118" class="k-desc">Jamais de mix</text>
+    <text x="10" y="130" class="k-mono" fill="#34d399">0 blocage</text>
+  </g>
+</svg>

@@ -1,73 +1,177 @@
 # Router des Pauvres 🗑️🚀
 
 <p align="center">
-  <img src="assets/banner.jpg" alt="Router des Pauvres" width="100%" />
+  <img src="assets/banner.jpg" alt="Router des Pauvres 🗑️🚀" width="100%" />
 </p>
 
-Proxy local OpenAI-compat qui route vers les **modèles frontière gratuits** d'OpenCode Zen — pour ceux qui n'ont pas de budget API. Le « router des pauvres ».
+<p align="center">
+  <a href="#-fonctionnalités-clés"><img src="https://img.shields.io/badge/Rust-std--only-f97316?style=for-the-badge&logo=rust&logoColor=white" alt="Rust std-only" /></a>
+  <a href="#-fonctionnalités-clés"><img src="https://img.shields.io/badge/Taille-~650_KB-3b82f6?style=for-the-badge&logo=cargo&logoColor=white" alt="Binaire 650KB" /></a>
+  <a href="#-modèles-frontière-gratuits--matrice-comparative"><img src="https://img.shields.io/badge/Budget_API-0_€_(100%25_Gratuit)-10b981?style=for-the-badge&logo=free&logoColor=white" alt="100% Gratuit" /></a>
+  <a href="#-endpoints-http"><img src="https://img.shields.io/badge/OpenAI-Compatible-8b5cf6?style=for-the-badge&logo=openai&logoColor=white" alt="OpenAI Compatible" /></a>
+  <a href="#-modèles-frontière-gratuits--matrice-comparative"><img src="https://img.shields.io/badge/Modèles-3_Frontières-ec4899?style=for-the-badge" alt="3 Modèles Frontière" /></a>
+  <a href="#-licence"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT" /></a>
+</p>
 
-## Pourquoi
+> **Le proxy local OpenAI-compat qui route vers les modèles frontière gratuits d'OpenCode Zen** — pour tous ceux qui refusent de payer des abonnements et n'ont aucun budget API.
 
-Depuis le 14 oct 2026, Zen exige le fingerprint du vrai client OpenCode (TLS+wire vérifié par MITM/replay). Impossible d'appeler l'API en direct avec un simple `curl`. Ce router délègue chaque requête au CLI officiel `opencode run` (qui passe la gate) et expose le tout en format `chat.completions` standard.
+---
 
-## Fonctionnalités
+## 💡 Pourquoi ce projet ?
 
-- **OpenAI-compat** : `POST /v1/chat/completions`, `GET /v1/models` — branche n'importe quel client (Hermes, scripts, curl…)
-- **⭐ GLM 5.3 Flash gratuit** en tête de cascade (frontière, testé en live)
-- **`frontier-robin-free`** — notre pseudo-modèle **round-robin permanent** : chaque requête tourne sur les frontières (glm → space-bunny → deepseek → glm → …). La répartition de charge en un seul nom de modèle.
+Depuis le **14 octobre 2026**, OpenCode Zen exige l'empreinte cryptographique du client officiel OpenCode (TLS handshake spécifique + wire verification anti-MITM / anti-replay).
+Impossible d'appeler l'API en direct avec un simple `curl` ou un client OpenAI standard sans se faire bloquer.
+
+**Router des Pauvres** résout élégamment le problème :
+1. Il reçoit vos requêtes sur son interface standard `POST /v1/chat/completions`.
+2. Il délègue l'exécution sous le capot au binaire officiel `opencode run` qui valide le fingerprint à 100%.
+3. Il restitue les flux en format `chat.completions` standard avec gestion des caches, du rate-limiting et de la redondance.
+
+---
+
+## 🏛️ Architecture & Flux d'Exécution
+
+<p align="center">
+  <img src="assets/architecture.svg" alt="Architecture & Request Flow" width="100%" />
+</p>
+
+### 🔄 Séquence d'une Requête
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as Client (Hermes, IDE, curl)
+    participant Router as pauvre-router (Rust std-only)
+    participant Cache as Cache Dédup (SHA-256)
+    participant Rate as Token Bucket (Anti-Spam)
+    participant Pool as Pool de Clés (Auto-Rotate)
+    participant Gate as opencode run (Gate Bypass)
+    participant Zen as OpenCode Zen (Free Frontier)
+
+    Client->>Router: POST /v1/chat/completions
+    Router->>Cache: Calcul du SHA-256 du prompt
+    alt Cache Hit (0 ms)
+        Cache-->>Client: Réponse immédiate depuis la RAM
+    else Cache Miss
+        Router->>Rate: Consommation de jeton (IP)
+        Router->>Pool: Sélectionne la clé active courante
+        Router->>Gate: Spawne 'opencode run <modèle>' (TLS fingerprint valide)
+        Gate->>Zen: Envoie payload authentifié
+        alt Succès 200 OK
+            Zen-->>Gate: Tokens streamés
+            Gate-->>Router: Réponse complète
+            Router->>Cache: Enregistre dans le LRU (TTL 10 min)
+            Router-->>Client: 200 OK (OpenAI-compat JSON)
+        else Erreur Quota 429
+            Gate-->>Router: Quota épuisé
+            Router->>Pool: Quarantaine (30 min) + Bascule clé suivante
+            Router->>Gate: Relance automatique (ou fallback anonyme)
+            Gate-->>Client: Réponse réussie sans coupure
+        end
+    end
+```
+
+---
+
+## ✨ Fonctionnalités Clés
+
+<p align="center">
+  <img src="assets/features-grid.svg" alt="Fonctionnalités Clés" width="100%" />
+</p>
+
+- **OpenAI-compat** : `POST /v1/chat/completions`, `GET /v1/models` — branche n'importe quel client (Hermes, scripts, curl, Continue.dev, VSCode…)
+- **⭐ GLM 5.3 Flash gratuit** en tête de cascade (qualité frontière, testé en live)
+- **`frontier-robin-free`** — notre pseudo-modèle **round-robin permanent** : chaque requête tourne sur les frontières (`glm` → `space-bunny` → `deepseek` → `glm` → …). La répartition de charge en un seul identifiant de modèle.
 - **2 modes de routage** (switch à chaud via `/admin/mode`) :
   - `priority` (défaut) : **exhaust le meilleur modèle** avant de basculer sur le suivant
-  - `roundrobin` : répartit la charge à chaque requête
+  - `roundrobin` : répartit la charge uniformément à chaque requête
 - **🔑 Rotation de clés API toujours active** : le pool tourne en round-robin par défaut — clé quota-blocked = cooldown 30 min persistant, la suivante prend le relais, **fallback anonyme** si aucune clé utilisable (jamais de mix clé/anonyme, sinon `Invalid credential` chez Zen)
-- **Détection d'exhaustion** : classification (quota/rate-limit/model invalide/timeout) + **cooldowns à backoff exponentiel** (2 min → 1 h)
-- **Anti-spam** : token bucket par IP (rafale 5, 20 req/min), plafond 3 spawns opencode, body max 1,5 Mo
-- **Cache de déduplication** : prompts identiques servis du cache (TTL 10 min, LRU 128, sha256 maison)
-- **Admin** : `/admin/stats`, `/admin/mode`, `/admin/keys`, `/admin/reset`
-- **Persistance** : santé + stats (60 s) et cooldowns de clés sur disque
-- **Rust std-only** : binaire unique ~650 KB, zéro tokio/reqwest
+- **Détection d'exhaustion & Quarantaine** : classification (quota / rate-limit / model invalide / timeout) + **cooldowns à backoff exponentiel** (2 min → 1 h)
+- **Anti-spam robuste** : token bucket par IP (rafale 5, 20 req/min), plafond 3 spawns opencode simultanés, body max 1,5 Mo
+- **Cache de déduplication** : prompts identiques servis du cache en 0 ms (TTL 10 min, LRU 128, hash sha256 maison)
+- **Administration à chaud** : `/admin/stats`, `/admin/mode`, `/admin/keys`, `/admin/reset`
+- **Persistance automatique** : santé + stats (60 s) et cooldowns de clés enregistrés sur disque
+- **Rust std-only** : binaire unique ~650 KB, zéro dépendance lourde (aucun tokio/reqwest)
 
-## Modèles frontière (les meilleurs gratuits, testés en live 2026-10-16)
+---
 
-| Modèle | Latence | Note |
+## ⚡ Modèles Frontière Gratuits & Matrice Comparative
+
+<p align="center">
+  <img src="assets/models-matrix.svg" alt="Matrice des Modèles Frontière" width="100%" />
+</p>
+
+| Modèle | Latence | Spécialité | Statut |
+|---|---|---|---|
+| `space-bunny-free` | **6,0 s** ⚡ | Le sprinter ultra-rapide pour questions courtes et chat | 🟢 Gratuit Zen |
+| `deepseek-v4.1-flash-free` | **6,0 s** ⚡ | Modèle polyvalent DeepSeek V4.1, analyse & synthèse | 🟢 Gratuit Zen |
+| ⭐ `glm-5.3-flash-free` | 11,3 s | **Frontière de pointe** — qualité supérieure pour le code et le raisonnement | 🟢 Gratuit Zen |
+| 🔄 `frontier-robin-free` | *Dynamique* | **Pseudo-modèle maître** — équilibrage de charge tournant sur les 3 frontières | 🟣 Master Load-Balancer |
+
+> **Ordre de cascade en mode priorité :**  
+> `glm-5.3-flash-free` ➔ `space-bunny-free` ➔ `deepseek-v4.1-flash-free`.  
+> Le modèle demandé explicitement passe toujours en premier ; `frontier-robin-free` route sur les trois en rotation continue.
+
+---
+
+## 🔑 Rotation de Clés & Résilience Quotas
+
+<p align="center">
+  <img src="assets/key-rotation.svg" alt="Cycle de rotation de clés" width="100%" />
+</p>
+
+1. **Pool Actif** : Vos clés API tournent en round-robin pour maximiser le débit sans saturer une clé unique.
+2. **Détection 429** : Dès qu'une clé retourne un quota épuisé, elle est placée en quarantaine immédiate pendant 30 min (persisté dans `~/.pauvre-router-keys.json`).
+3. **Bascule Instantanée** : La clé suivante prend le relais sans que le client ne subisse d'erreur.
+4. **Fallback Anonyme** : Si toutes les clés du pool sont en quarantaine, le router bascule en mode Zen Anonyme sans mélanger les états.
+5. **Backoff Progressif** : En cas d'erreurs répétées (rate-limit ou timeout), les cooldowns passent de 2 min ➔ 5 min ➔ 15 min ➔ 1 h.
+
+---
+
+## 🔌 Endpoints HTTP
+
+| Endpoint | Méthode | Description |
 |---|---|---|
-| `space-bunny-free` | **6,0 s** | le sprinter |
-| `deepseek-v4.1-flash-free` | **6,0 s** | ex æquo, DeepSeek V4.1 |
-| ⭐ `glm-5.3-flash-free` | 11,3 s | **frontière, désormais gratuit** — qualité > latence |
+| `/health` | `GET` | État vivant, version compilée et requêtes in-flight |
+| `/v1/models` | `GET` | Liste des modèles disponibles (`frontier-robin-free` + les 3 frontières) |
+| `/v1/chat/completions` | `POST` | Chat standard OpenAI-compatible (cascade/mode automatique) |
+| `/admin/stats` | `GET` | Métriques d'usage, état de santé, statistiques anti-spam, mode actif |
+| `/admin/mode` | `GET` / `POST` | Consultation et bascule à chaud du mode de routage (`priority` / `roundrobin`) |
+| `/admin/keys` | `GET` | Métadonnées du pool de clés (clés masquées pour sécurité) |
+| `/admin/keys/add` | `POST` | Ajoute une clé API au pool : `{"key": "sk-..."}` |
+| `/admin/keys/remove` | `POST` | Retire une clé API du pool : `{"key": "sk-..."}` |
+| `/admin/keys/reanimate`| `POST` | Réactive une clé ou purge tous les cooldowns : `{}` ou `{"key": "sk-..."}` |
+| `/admin/reset` | `POST` | Purge intégrale du cache de déduplication et des cooldowns modèles |
 
-Ordre de cascade : `glm-5.3-flash-free` → `space-bunny-free` → `deepseek-v4.1-flash-free`. Le modèle demandé passe toujours en premier ; `frontier-robin-free` route sur les trois en tournant.
+---
 
-## Endpoints
+## 🚀 Installation & Démarrage
 
-| Endpoint | Description |
-|---|---|
-| `GET /health` | vivant + version + in-flight |
-| `GET /v1/models` | `frontier-robin-free` + les 3 frontières |
-| `POST /v1/chat/completions` | chat (cascade/mode automatique) |
-| `GET /admin/stats` | usage, santé, spam, pool de clés, mode |
-| `GET`/`POST /admin/mode` | mode de routage (`priority`/`roundrobin`) |
-| `GET /admin/keys` | méta du pool (jamais les valeurs) |
-| `POST /admin/keys/add` | `{"key": "sk-..."}` — ajoute au pool |
-| `POST /admin/keys/remove` | `{"key": "sk-..."}` — retire |
-| `POST /admin/keys/reanimate` | `{}` ou `{"key": "sk-..."}` — réactive |
-| `POST /admin/reset` | purge cache + cooldowns modèles |
-
-## Installation
-
-Guide complet (Windows/Linux/macOS, auto-start, plugin Hermes) : **[SKILL.md](SKILL.md)**. Feuille de route : [TODO.md](TODO.md).
+Guide complet multi-plateformes (Windows / Linux / macOS, service auto-start, plugin Hermes) : **[SKILL.md](SKILL.md)**.  
+Feuille de route et évolutions : **[TODO.md](TODO.md)**.
 
 ```bash
+# Compilation du binaire optimisé (~650 KB)
 cargo build --release
+
+# Lancement
 ./target/release/pauvre-router.exe
 ```
 
-| Var | Défaut | Rôle |
-|---|---|---|
-| `PAUVRE_OPENCODE` | chemin auto (Windows) | binaire CLI opencode (obligatoire sur Linux/macOS) |
-| `PAUVRE_STATE` | `~/.pauvre-router-state.json` | état (stats/santé) |
-| `PAUVRE_KEYS` | `~/.pauvre-router-keys.json` | pool de clés |
-| `PAUVRE_MODE` | `priority` | mode de routage au boot |
+### Variables d'Environnement
 
-## Intégration Hermes
+| Variable | Valeur par défaut | Description |
+|---|---|---|
+| `PAUVRE_OPENCODE` | Chemin auto détecté (Windows) | Chemin absolu vers le CLI `opencode` (*requis sur Linux/macOS*) |
+| `PAUVRE_STATE` | `~/.pauvre-router-state.json` | Fichier de persistance des statistiques et de la santé |
+| `PAUVRE_KEYS` | `~/.pauvre-router-keys.json` | Fichier de stockage sécurisé du pool de clés et cooldowns |
+| `PAUVRE_MODE` | `priority` | Mode de routage par défaut au démarrage (`priority` ou `roundrobin`) |
+
+---
+
+## 🦹 Intégration Hermes Desktop
+
+Ajoutez ce provider dans votre configuration Hermes (`config.yaml`) :
 
 ```yaml
 custom_providers:
@@ -82,20 +186,28 @@ custom_providers:
     deepseek-v4.1-flash-free: {}
 ```
 
-⚠️ La liste `models:` du `config.yaml` est **statique** : c'est elle que lit le picker de modèles d'Hermes. Nouveau modèle dans le router → l'ajouter aussi dans le config.
+> ⚠️ **Note :** La liste `models:` du `config.yaml` est statique : c'est elle qui alimente le picker de modèles d'Hermes.
 
 Résultat dans le picker d'Hermes Desktop — le groupe **ZEN-FREE** avec les 4 modèles, sélection de `space-bunny-free` (contexte XHIGH) :
 
-![Modèles zen-free dans le picker Hermes Desktop](assets/hermes-picker.png)
+<p align="center">
+  <img src="assets/hermes-picker.png" alt="Modèles zen-free dans le picker Hermes Desktop" width="85%" />
+</p>
 
-## Plugin desktop Hermes
+### 🖥️ Plugin Desktop Hermes
 
-Pane de monitoring live (santé, cooldowns, stats, mode en badge) — voir [`SKILL.md`](SKILL.md) §3 pour l'installation pas-à-pas.
+Un pane de monitoring en temps réel pour Hermes (santé, cooldowns, métriques, mode en badge) est fourni avec le projet.  
+Consultez le **[`SKILL.md`](SKILL.md) §3** pour la configuration pas-à-pas.
 
-## Releases
+---
 
-Les binaires Windows/Linux/macOS sont construits par GitHub Actions à chaque tag : page [Releases](../../releases).
+## 📦 Releases
 
-## Licence
+Les binaires Windows, Linux et macOS sont construits et packagés automatiquement par GitHub Actions à chaque tag :  
+Consultez la page **[Releases](../../releases)** pour télécharger les binaires précompilés.
 
-MIT — mais le nom reste « le router des pauvres ». 🗑️
+---
+
+## 📜 Licence
+
+Projet distribué sous licence **MIT** — mais le nom officiel reste « **le router des pauvres** ». 🗑️🚀
