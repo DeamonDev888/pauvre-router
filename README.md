@@ -140,7 +140,7 @@ Ajoutez ce provider dans votre configuration Hermes (`config.yaml`) :
 
 ```yaml
 custom_providers:
-- name: router-des-pauvres
+- name: pauvre-router
   base_url: http://127.0.0.1:4445/v1
   api_key: pauvre
   api_mode: chat_completions
@@ -154,10 +154,10 @@ custom_providers:
 
 > ⚠️ **Note :** La liste `models:` du `config.yaml` est statique : c'est elle qui alimente le picker de modèles d'Hermes.
 
-Résultat dans le picker d'Hermes Desktop — le groupe **ROUTER-DES-PAUVRES** avec les 4 modèles, sélection de `space-bunny-free` (contexte XHIGH) :
+Résultat dans le picker d'Hermes Desktop — le groupe **PAUVRE-ROUTER** avec les 4 modèles, sélection de `space-bunny-free` (contexte XHIGH) :
 
 <p align="center">
-  <img src="assets/hermes-picker.png" alt="Modèles router-des-pauvres dans le picker Hermes Desktop" width="85%" />
+  <img src="assets/hermes-picker.png" alt="Modèles pauvre-router dans le picker Hermes Desktop" width="85%" />
 </p>
 
 ### 🖥️ Plugin Desktop Hermes

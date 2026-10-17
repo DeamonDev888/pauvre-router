@@ -90,7 +90,7 @@ elle que lit le picker de modèles :
 
 ```yaml
 custom_providers:
-- name: router-des-pauvres
+- name: pauvre-router
   base_url: http://127.0.0.1:4445/v1
   api_key: pauvre
   api_mode: chat_completions
