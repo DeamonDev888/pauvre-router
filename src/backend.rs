@@ -63,11 +63,21 @@ pub fn call_at(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.args(["run", "--model", &format!("opencode/{model}")])
-        .env("USERPROFILE", "C:\\Users\\Deamon")
-        .env("HOMEDRIVE", "C:")
-        .env("HOMEPATH", "\\Users\\Deamon")
-        .env("PATH", r"C:\Windows\System32");
+    // `--agent plan` : l'agent `build` par défaut est un agent codeur
+    // ANGLAIS avec outils — il répond en anglais et coupe après « : »
+    // quand un appel d'outil n'aboutit pas en mode non-interactif.
+    // L'agent `plan` répond en texte, dans la langue de l'utilisateur.
+    cmd.args([
+        "run",
+        "--agent",
+        "plan",
+        "--model",
+        &format!("opencode/{model}"),
+    ])
+    .env("USERPROFILE", "C:\\Users\\Deamon")
+    .env("HOMEDRIVE", "C:")
+    .env("HOMEPATH", "\\Users\\Deamon")
+    .env("PATH", r"C:\Windows\System32");
     match api_key {
         Some(k) => cmd.env("OPENCODE_API_KEY", k),
         None => cmd.env_remove("OPENCODE_API_KEY"),
