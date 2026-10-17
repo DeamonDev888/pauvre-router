@@ -121,6 +121,55 @@ fn completion_body(text: &str, model: &str) -> serde_json::Value {
     })
 }
 
+/// Corps SSE (chat.completion.chunk) : le format que le client OpenAI
+/// attend en streaming. Sans ça, Hermes lit 0 chunk → EmptyStreamError
+/// → fallback provider. Rôle → contenu → fin → [DONE].
+fn sse_body(text: &str, model: &str) -> String {
+    let id = format!("chatcmpl-pauvre-{}-{}", std::process::id(), now_epoch());
+    let created = now_epoch();
+    let chunk = |delta: serde_json::Value, finish: Option<&str>| -> String {
+        let c = serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        });
+        format!("data: {c}\n\n")
+    };
+    let mut out = chunk(
+        serde_json::json!({"role": "assistant", "content": ""}),
+        None,
+    );
+    if !text.is_empty() {
+        out.push_str(&chunk(serde_json::json!({"content": text}), None));
+    }
+    out.push_str(&chunk(serde_json::json!({}), Some("stop")));
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
+/// Répond la complétion : SSE si le client a demandé stream:true
+/// (Hermes le fait toujours), JSON sinon (curl, tests).
+fn respond_chat(conn: &mut HttpConn, text: &str, model: &str, stream: bool, keep: bool) {
+    if stream {
+        let body = sse_body(text, model);
+        let _ = conn.write_stream(200, "OK", "text/event-stream", move |sink| {
+            sink.write_all(body.as_bytes())
+        });
+    } else {
+        let b = completion_body(text, model);
+        let _ = conn.write_response(
+            200,
+            "OK",
+            "application/json",
+            b.to_string().as_bytes(),
+            &[],
+            keep,
+        );
+    }
+}
+
 /// Sert UNE connexion entière (1..n requêtes en keep-alive) sous deadline.
 fn serve_conn(stream: TcpStream, peer: std::net::IpAddr, shared: &Arc<Shared>) {
     let peer_str = peer.to_string();
@@ -537,6 +586,10 @@ fn handle_chat(
         .get("messages")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let wants_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let prompt = match compose_prompt(&messages) {
         Ok(p) => p,
         Err(e) => {
@@ -556,15 +609,7 @@ fn handle_chat(
     // 3) cache
     if let Some(text) = shared.cache.lock().unwrap().get(&model_req, &prompt) {
         shared.stats.lock().unwrap().cache_hits += 1;
-        let b = completion_body(&text, &model_req);
-        let _ = conn.write_response(
-            200,
-            "OK",
-            "application/json",
-            b.to_string().as_bytes(),
-            &[],
-            keep,
-        );
+        respond_chat(conn, &text, &model_req, wants_stream, keep);
         return;
     }
 
@@ -653,15 +698,7 @@ fn handle_chat(
                     .lock()
                     .unwrap()
                     .put(&model_req, &prompt, &ok.text);
-                let b = completion_body(&ok.text, &model_req);
-                let _ = conn.write_response(
-                    200,
-                    "OK",
-                    "application/json",
-                    b.to_string().as_bytes(),
-                    &[],
-                    keep,
-                );
+                respond_chat(conn, &ok.text, &model_req, wants_stream, keep);
                 shared.in_flight.fetch_sub(1, Ordering::Relaxed);
                 return;
             }
