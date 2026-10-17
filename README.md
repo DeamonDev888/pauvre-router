@@ -5,6 +5,10 @@
 </p>
 
 <p align="center">
+  <em>🇬🇧 English documentation: <a href="README_EN.md">README_EN.md</a></em>
+</p>
+
+<p align="center">
   <a href="#-fonctionnalités-clés"><img src="https://img.shields.io/badge/Rust-std--only-f97316?style=for-the-badge&logo=rust&logoColor=white" alt="Rust std-only" /></a>
   <a href="#-fonctionnalités-clés"><img src="https://img.shields.io/badge/Taille-~650_KB-3b82f6?style=for-the-badge&logo=cargo&logoColor=white" alt="Binaire 650KB" /></a>
   <a href="#-modèles-frontière-gratuits--matrice-comparative"><img src="https://img.shields.io/badge/Budget_API-0_€_(100%25_Gratuit)-10b981?style=for-the-badge&logo=free&logoColor=white" alt="100% Gratuit" /></a>
