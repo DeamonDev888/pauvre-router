@@ -400,7 +400,7 @@ fn e2e_antispam_429_puis_requete_normale_ok() {
     // 2) trois chats passent (rafale), le 4e est bloqué
     let (a, _) = chat(i.port, "glm-5.3-flash-free", "PONG one").unwrap();
     let (b, _) = chat(i.port, "glm-5.3-flash-free", "PONG two").unwrap();
-    let (c, vc) = chat(i.port, "glm-5.3-flash-free", "PONG three").unwrap();
+    let (c, _vc) = chat(i.port, "glm-5.3-flash-free", "PONG three").unwrap();
     let (d, vd) = chat(i.port, "glm-5.3-flash-free", "PONG four").unwrap();
     assert_eq!(a, 200);
     assert_eq!(b, 200);
