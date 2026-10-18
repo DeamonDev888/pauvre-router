@@ -7,17 +7,25 @@
 
 ## 1. Verdict
 
-**Le code du routeur est sain ; le service est victime de son réseau.**
-Toutes les erreurs remontées aux clients proviennent d'OpenCode (l'amont)
-qui **bannit l'IP de sortie du VPN** du PC :
+**Le code du routeur est sain ; l'IP de la machine est flaggée « abusive »
+par OpenCode — cause : volume d'usage automatisé, pas le VPN.**
 
+Message exact de la gateway (`opencode.ai/zen/v1`, via le CLI) :
 > « OpenCode's free models aren't available from your current network
 > because we've detected abusive traffic from this IP address. »
 
-- IP de sortie actuelle : `195.242.214.19` (IP VPN, pas l'IP maison).
-- OpenCode détecte le trafic comme abusif depuis cette IP → refuse les
-  modèles gratuits → le routeur classifie `Transient`, cascade sur les
-  4 modèles frontier → tous bannis → cooldown global de 30 s.
+**Corrections d'hypothèses pendant l'audit (méthode éliminatoire) :**
+1. ~~IP VPN bannie~~ — FAUX : après déconnexion VPN, IP maison
+   (Cogeco résidentiel, 157.208.25.18, non-proxy/non-hosting) bannie aussi.
+2. ~~Fingerprint de l'install opencode~~ — FAUX : profil de données frais
+   (USERPROFILE vierge, nouveau opencode.db) → même ban.
+3. ~~Trafic automatisé en cours pendant les tests~~ — FAUX : 0 process
+   opencode, compteur du routeur figé (233 req sur 45 s d'observation).
+4. **Retenu : flag persistant sur l'IP après franchissement de seuil de
+   volume.** Preuves : ban confirmé 35+ min après l'arrêt de tout trafic ;
+   le GET `/zen/v1/models` (léger) passe en 200, seul l'endpoint
+   d'inférence est filtré ; le curl brut reçoit une AUTRE 403
+   (`FreeTierError` gate fingerprint — normale), le ban ne vise que le CLI.
 
 ## 2. Ce qui a été vérifié (tout vert)
 
@@ -34,42 +42,73 @@ qui **bannit l'IP de sortie du VPN** du PC :
 
 ## 3. Chronologie des preuves
 
-- 10:36 — process `pauvre-router.exe` PID 5384 démarré (depuis
-  `target\release`, binaire du commit HEAD).
+- 10:36 — process `pauvre-router.exe` PID 5384 démarré ; **120 appels OK**
+  en ~20 min (stats `/admin/stats`) avant la première erreur à ~10:55.
 - ~10:55 — 5× `POST /v1/chat/completions` sur les 5 modèles : toutes
   échouent (`upstream_error` / cooldown global après cascade).
-- Test direct d'opencode hors routeur : même bannière de bannissement IP
-  (« turn it off and try again ») — cause amont confirmée.
-- 10:57 — `https://api.ipify.org` → `195.242.214.19` = sortie VPN.
-- 10:58 — `ssh kali` → `Permission denied` (piège VPN documenté dans le
-  MEMO serveur Kali) : le VPN capture tout le trafic de la machine.
+- Test direct d'opencode hors routeur : même message de bannissement IP.
+- 10:57 — `https://api.ipify.org` → `195.242.214.19` = sortie VPN ;
+  `ssh kali` → `Permission denied` (VPN capture le LAN).
+- VPN déconnecté (~11:20) — nouvelle IP `157.208.25.18` (Cogeco
+  résidentiel, proxy=false, hosting=false) : **CLI toujours banni**.
+- Table de routage vérifiée : route par défaut = 192.168.40.1 (box),
+  plus aucun adaptateur VPN, pas de proxy env, pas d'entrée hosts.
+- curl brut sur `opencode.ai/zen/v1/chat/completions` : 403 avec un
+  message DIFFÉRENT (`FreeTierError` — gate fingerprint, attendue hors
+  CLI) ; `GET /zen/v1/models` : 200 OK → filtrage ciblé sur l'inférence.
+- `opencode auth list` : 0 credentials (usage 100% anonyme confirmé).
+- Profil opencode frais (USERPROFILE vierge) : même ban → pas un flag
+  d'empreinte locale.
+- 11:35+ — zéro trafic en cours (0 process, compteur routeur figé) et le
+  ban persiste → flag IP durable, pas une limite tempo active.
+- **Volume DB opencode** : 370 sessions / 1 115 messages au total ;
+  oct-17 : **814 messages, 239 sessions** ; oct-18 matin : 40 messages /
+  20 sessions avant le flag. ~1 400 tokens input/message en moyenne.
 - Test clippy réel : 1 erreur `unused variable vc` (tests/e2e.rs:403) →
   corrigée (`_vc`) → clippy + fmt verts.
 
 ## 4. Cause racine (chaîne complète)
 
-1. Le VPN Windows (pool 10.2.0.x) route TOUT le trafic (0.0.0.0/0).
-2. Son IP de sortie `195.242.214.19` est bannie par OpenCode
-   (« abusive traffic », indépendant du compte).
-3. opencode CLI renvoie l'erreur → routeur classifie `Transient`
-   (correct : ni `Exhausted` ni `ModelInvalid`).
-4. Cascade frontier : essai des 4 modèles → tous reçoivent le même ban.
-5. Cooldown global 30 s → erreur finale `upstream_error`.
+1. Le routeur spawn `opencode.exe` (anonyme, 0 credentials) pour chaque
+   requête — plusieurs spawns par requête client en cascade.
+2. Volume automatisé massif : 814 messages hier, 120 appels OK ce matin
+   → franchissement du seuil « abusive traffic » d'OpenCode en milieu de
+   matinée (jamais de 429/Exhausted vu avant : le passage au ban est sec).
+3. La gateway `opencode.ai/zen/v1` flague l'IP (durable, pas un cooldown)
+   et refuse les modèles free au CLI ; la détection est indépendante du
+   compte (0 credentials) et de l'empreinte locale (profil frais testé).
+4. Le routeur classifie `Transient` (correct), cascade les 4 modèles
+   frontier — tous frappés par le même ban IP → cooldown global 30 s.
+5. Le VPN n'était qu'un facteur aggravant (2 IPs différentes bannies :
+   195.242.214.19 puis 157.208.25.18).
 
 ## 5. Correctifs appliqués
 
 - `tests/e2e.rs:403` : `vc` → `_vc` (var inutilisée, clippy -D warnings).
-- Commit et push à suivre (v0.7.5 ou inclus dans le prochain bump).
+- Commit `80d785e` poussé sur main.
 
-## 6. Recommandations (aucune urgente côté code)
+## 6. Recommandations
 
-1. **Réseau** : désactiver le VPN (ou faire une exception de routage pour
-   `opencode.ai` hors tunnel) → les modèles free repassent immédiatement ;
-   c'est le même VPN qui bloque SSH vers kali 192.168.40.15.
-2. **Robustesse** (optionnel) : classifier la bannière « aren't available
-   from your current network » comme un cas dédié (ex. `IpBanned`) avec
-   message clair au client (« IP bannie par l'amont — vérifie ton VPN »)
-   au lieu d'un `Transient` générique.
-3. **Robustesse** (optionnel) : garder une trace IP de sortie (healthcheck
-   ipify périodique) exposée dans `/admin/stats` pour diagnostiquer ce
-   genre d'incident en un coup d'œil.
+### Résoudre le blocage actuel
+1. **Attendre la levée du flag** (durée inconnue, heures à jours) avec
+   zéro trafic — tout nouvel essai depuis cette IP le ré-arme peut-être.
+2. **Réduire le volume** ensuite : le free tier anonyme n'est pas conçu
+   pour 800+ messages/jour automatisés. Options : limiter le routeur
+   (rate-limit global / cache déjà présent : 7 hits), réserver le free
+   pour de petits prompts, ou `opencode auth login` (compte payant
+   OpenCode Go contourne le free tier et son anti-abus).
+3. **Autre réseau** pour tester la levée : partage de connexion mobile
+   (IP différente) → si le CLI passe, ban IP confirmé à 100%.
+
+### Robustesse routeur (optionnel, code)
+4. Classifier le message « aren't available from your current network »
+   comme cas dédié (`IpFlagged`) avec réponse claire au client au lieu
+   d'un `Transient` générique + cascade inutile (les 4 modèles partagent
+   la même gateway → cascade vouée à l'échec quand c'est un ban IP).
+5. Exposer la sortie du flag (détection du message) dans `/admin/stats`
+   pour diagnostic immédiat.
+
+### Kali (incident séparé, constaté pendant l'audit)
+6. `192.168.40.15` : ping 1/3 OK, port 22 timeout → probable WiFi
+   instable ou machine endormie ; à vérifier quand le réseau sera
+   propre (télécommande impossible tant que SSH est down).
