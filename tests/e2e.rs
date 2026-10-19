@@ -59,6 +59,7 @@ fn start(tag: &str, tune: impl FnOnce(&mut ServerConfig)) -> Instance {
         gate_wait: Duration::from_millis(500),
         save_interval: Duration::from_secs(3600),
         mode: "priority".into(),
+        antiban_budget: 10_000, // large par défaut : les tests anti-ban le ressèrent
     };
     tune(&mut cfg);
     let bound = server::bind_server(&cfg).expect("bind serveur E2E");
@@ -583,6 +584,7 @@ fn e2e_persistance_etat_sur_reboot() {
         gate_wait: Duration::from_millis(500),
         save_interval: Duration::from_secs(3600),
         mode: "priority".into(),
+        antiban_budget: 10_000,
     };
     let bound = server::bind_server(&cfg).expect("bind");
     let port = bound.port;
@@ -778,5 +780,140 @@ fn e2e_cache_clear_recalcule() {
     assert!(
         stats["stats"]["ok_total"].as_u64().unwrap_or(0) >= 2,
         "2 calculs réels attendus: {stats}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Anti-ban : budget global + circuit breaker flag IP
+// (leçon de l'incident du 18 oct 2026 — IPs flaggées « abusive traffic »)
+// ---------------------------------------------------------------------
+
+#[test]
+fn e2e_antiban_budget_serre_bloque_sans_spawner() {
+    // budget = plancher (6/min) : 8 prompts distincts en séquence → au plus
+    // 6 atteignent le backend, les suivants sont refusés par le BUDGET
+    // (429 rate_limit_error). Tolérant aux RST-fantômes (qui consomment un
+    // jeton de plus côté serveur) : on n'exige jamais count(200) exact.
+    let i = start("antiban-budget", |c| {
+        c.antiban_budget = 6;
+    });
+    let mut ok = 0;
+    let mut blocked = 0;
+    for n in 1..=8 {
+        let (c, v) = chat(i.port, "beam-free", &format!("PONG budget {n}")).unwrap();
+        match c {
+            200 => ok += 1,
+            429 => {
+                blocked += 1;
+                assert_eq!(v["error"]["type"], "rate_limit_error", "v={v}");
+                assert!(v["error"]["retry_after"].as_u64().unwrap_or(0) >= 1);
+            }
+            other => panic!("status inattendu {other} pour n={n}: {v}"),
+        }
+    }
+    assert!(ok >= 5, "au moins 5 passages (budget 6): ok={ok}");
+    assert!(blocked >= 1, "le budget doit finir par bloquer");
+    assert!(ok <= 6, "JAMAIS plus de budget appels backend: ok={ok}");
+    let stats = get_json(i.port, "/admin/stats");
+    assert!(
+        stats["stats"]["ok_total"].as_u64().unwrap_or(0) <= 6,
+        "le backend n'a jamais été sur-dépensé: {stats}"
+    );
+    assert_eq!(
+        stats["antiban"]["backend_calls_this_window"]
+            .as_u64()
+            .unwrap_or(0),
+        6,
+        "fenêtre pleine: {:?}",
+        stats["antiban"]
+    );
+    // re-montée du budget à chaud (admin) : le prochain appel repasse
+    let (code, b) = req(
+        i.port,
+        "POST",
+        "/admin/antiban",
+        br#"{"budget":100}"#,
+        false,
+    )
+    .unwrap();
+    assert_eq!(code, 200, "{b}");
+    let (c9, v9) = chat(i.port, "beam-free", "PONG budget neuf").unwrap();
+    assert_eq!(c9, 200, "budget relevé → repasse: {v9}");
+}
+
+#[test]
+fn e2e_antiban_flag_ouvre_le_circuit_et_le_re_close_sur_succes() {
+    // FLAGGED (échoue sur tous les modèles) → cascade complète → circuit
+    // ouvert ; le chat suivant est refusé sans spawn (ok_total figé) ;
+    // POST /admin/antiban {"release":true} (levier opérateur, ex. après
+    // un changement de réseau) referme le circuit → le chat repasse.
+    let i = start("antiban-flag", |c| {
+        c.antiban_budget = 100;
+        c.call_timeout = Duration::from_millis(8000);
+    });
+    let (c1, v1) = chat(i.port, "glm-5.3-flash-free", "FLAGGED please").unwrap();
+    assert_eq!(c1, 502, "cascade en échec complet: {v1}");
+    let a = get_json(i.port, "/admin/antiban");
+    assert_eq!(a["flagged"], true, "circuit ouvert après flag: {a}");
+    assert!(
+        a["blocked_secs"].as_u64().unwrap_or(0) > 500,
+        "pause ~600s: {a}"
+    );
+    let n_ok_avant = get_json(i.port, "/admin/stats")["stats"]["ok_total"]
+        .as_u64()
+        .unwrap_or(0);
+    let (c2, v2) = chat(i.port, "glm-5.3-flash-free", "PONG après flag").unwrap();
+    assert_eq!(c2, 429, "circuit ouvert = refus sec: {v2}");
+    assert_eq!(v2["error"]["type"], "ip_flagged_error");
+    let n_ok_apres = get_json(i.port, "/admin/stats")["stats"]["ok_total"]
+        .as_u64()
+        .unwrap_or(0);
+    assert_eq!(
+        n_ok_apres, n_ok_avant,
+        "AUCUN spawn pendant le circuit ouvert"
+    );
+    // levier opérateur : release + purge du registre (cooldowns IpFlagged
+    // des 4 modèles posés par la cascade, sinon « tous en cooldown »)
+    let (code, b) = req(
+        i.port,
+        "POST",
+        "/admin/antiban",
+        br#"{"release":true}"#,
+        false,
+    )
+    .unwrap();
+    assert_eq!(code, 200, "{b}");
+    let (cc, _) = req(i.port, "POST", "/admin/cache/clear", b"", false).unwrap();
+    assert_eq!(cc, 200);
+    let (c3, v3) = chat(i.port, "glm-5.3-flash-free", "PONG guérison").unwrap();
+    assert_eq!(c3, 200, "circuit refermé, le backend répond: {v3}");
+    let a3 = get_json(i.port, "/admin/antiban");
+    assert_eq!(a3["flagged"], false, "succès → circuit refermé: {a3}");
+}
+
+#[test]
+fn e2e_antiban_endpoint_admin() {
+    // GET /admin/antiban expose budget + compteur ; POST change le budget
+    // à chaud (plancher MIN_BUDGET=6 respecté) et /admin/stats embarque
+    // le bloc antiban.
+    let i = start("antiban-admin", |_| {});
+    let a = get_json(i.port, "/admin/antiban");
+    assert_eq!(a["budget_per_min"].as_u64().unwrap_or(0), 10_000);
+    assert_eq!(a["flagged"], false);
+    let (code, b) = req(i.port, "POST", "/admin/antiban", br#"{"budget":2}"#, false).unwrap();
+    assert_eq!(code, 200, "{b}");
+    let a2 = get_json(i.port, "/admin/antiban");
+    assert_eq!(
+        a2["budget_per_min"].as_u64().unwrap_or(0),
+        6,
+        "plancher 6 appliqué: {a2}"
+    );
+    let (code2, b2) = req(i.port, "POST", "/admin/antiban", br#"{}"#, false).unwrap();
+    assert_eq!(code2, 400, "budget manquant → 400: {b2}");
+    let stats = get_json(i.port, "/admin/stats");
+    assert_eq!(
+        stats["antiban"]["budget_per_min"].as_u64().unwrap_or(0),
+        6,
+        "stats embarque l'état anti-ban: {stats}"
     );
 }

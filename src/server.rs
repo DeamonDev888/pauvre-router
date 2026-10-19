@@ -60,6 +60,8 @@ pub struct ServerConfig {
     pub save_interval: Duration,
     /// Mode de routage initial : "priority" | "roundrobin".
     pub mode: String,
+    /// Anti-ban : budget d'appels backend/min (fenêtre glissante 60 s).
+    pub antiban_budget: usize,
 }
 
 impl ServerConfig {
@@ -85,6 +87,10 @@ impl ServerConfig {
             gate_wait: Duration::from_secs(30),
             save_interval: Duration::from_secs(60),
             mode,
+            antiban_budget: std::env::var("PAUVRE_BUDGET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::antiban::DEFAULT_BUDGET),
         }
     }
 }
@@ -113,6 +119,8 @@ pub struct Shared {
     pub updater: Arc<Updater>,
     /// Exe backend, figé au boot (one-shot : Some au boot, jamais muté).
     pub backend_exe_cell: Mutex<Option<String>>,
+    /// Anti-ban : budget global + circuit breaker flag IP.
+    pub antiban: crate::antiban::AntiBan,
 }
 
 impl Shared {
@@ -134,6 +142,7 @@ impl Shared {
             backend_env: cfg.backend_env.clone(),
             backend_exe_cell: Mutex::new(Some(cfg.backend_exe.clone())),
             updater: Arc::new(Updater::new(VERSION.to_string())),
+            antiban: crate::antiban::AntiBan::new(cfg.antiban_budget),
         }
     }
 }
@@ -531,6 +540,85 @@ fn route_request(
         return;
     }
 
+    // ---- anti-ban ----
+    if req.method == "GET" && path == "/admin/antiban" {
+        let (used, flagged, blocked_secs) = shared.antiban.status();
+        let body = serde_json::json!({
+            "budget_per_min": shared.antiban.budget(),
+            "backend_calls_this_window": used,
+            "flagged": flagged,
+            "blocked_secs": blocked_secs,
+        });
+        let _ = conn.write_response(
+            200,
+            "OK",
+            "application/json",
+            body.to_string().as_bytes(),
+            &[],
+            keep,
+        );
+        return;
+    }
+    if req.method == "POST" && path == "/admin/antiban" {
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body).unwrap_or(serde_json::json!({}));
+        // release explicite : l'opérateur a changé de réseau (VPN off, autre
+        // IP) et veut sortir du circuit sans attendre la sonde des 10 min
+        let released = body
+            .get("release")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if released {
+            shared.antiban.release();
+        }
+        match body.get("budget").and_then(|v| v.as_u64()) {
+            Some(b) => {
+                let applied = shared.antiban.set_budget(b as usize);
+                let body = serde_json::json!({
+                    "budget_per_min": applied,
+                    "released": released,
+                    "applied": true,
+                });
+                let _ = conn.write_response(
+                    200,
+                    "OK",
+                    "application/json",
+                    body.to_string().as_bytes(),
+                    &[],
+                    keep,
+                );
+            }
+            None => {
+                if released {
+                    let body = serde_json::json!({"released": true});
+                    let _ = conn.write_response(
+                        200,
+                        "OK",
+                        "application/json",
+                        body.to_string().as_bytes(),
+                        &[],
+                        keep,
+                    );
+                } else {
+                    let b = err_body(
+                        "champ 'budget' (u64) ou 'release' (bool) requis",
+                        "invalid_request_error",
+                        None,
+                    );
+                    let _ = conn.write_response(
+                        400,
+                        "Bad Request",
+                        "application/json",
+                        b.to_string().as_bytes(),
+                        &[],
+                        keep,
+                    );
+                }
+            }
+        }
+        return;
+    }
+
     // ---- chat ----
     if req.method == "POST" && (path == "/v1/chat/completions" || path == "/chat/completions") {
         handle_chat(req, peer, peer_str, shared, conn, keep);
@@ -584,6 +672,7 @@ fn admin_stats(conn: &mut HttpConn, shared: &Arc<Shared>, keep: bool) {
     let keys_meta = shared.keystore.lock().unwrap().meta();
     let mode = shared.mode.lock().unwrap().clone();
     let upd = shared.updater.status();
+    let (antiban_used, antiban_flagged, antiban_blocked) = shared.antiban.status();
     let body = serde_json::json!({
         "version": VERSION,
         "stats": stats,
@@ -592,6 +681,12 @@ fn admin_stats(conn: &mut HttpConn, shared: &Arc<Shared>, keep: bool) {
         "keys": keys_meta,
         "mode": mode,
         "in_flight": shared.in_flight.load(Ordering::Relaxed),
+        "antiban": {
+            "budget_per_min": shared.antiban.budget(),
+            "backend_calls_this_window": antiban_used,
+            "flagged": antiban_flagged,
+            "blocked_secs": antiban_blocked,
+        },
         "update": {
             "available": upd.update_available,
             "latest": upd.latest,
@@ -805,6 +900,33 @@ fn handle_chat(
         return;
     }
 
+    // 3.5) anti-ban : budget global d'appels backend + circuit flag IP.
+    // L'incident du 18 oct 2026 (IP flaggée « abusive traffic » ~24 h) ne
+    // doit plus pouvoir se reproduire : au-delà du budget, 429 immédiat
+    // sans spawn ; circuit ouvert = refus sec aussi.
+    if let Err(wait) = shared.antiban.acquire() {
+        let kind = if shared.antiban.is_flagged() {
+            "ip_flagged_error"
+        } else {
+            "rate_limit_error"
+        };
+        let msg = if shared.antiban.is_flagged() {
+            "ip flaggee par l'amont (abusive traffic) : backend en pause, reessaie plus tard"
+        } else {
+            "budget backend atteint (protection anti-ban), reessaie plus tard"
+        };
+        let b = err_body(msg, kind, Some(wait.max(1)));
+        let _ = conn.write_response(
+            429,
+            "Too Many Requests",
+            "application/json",
+            b.to_string().as_bytes(),
+            &[("Retry-After", &wait.max(1).to_string())],
+            keep,
+        );
+        return;
+    }
+
     // 4) slot backend
     let _guard = match shared.gate.acquire(shared.gate_wait) {
         Some(g) => g,
@@ -930,6 +1052,11 @@ fn handle_chat(
                     backend::BackendError::Timeout { .. } => "timeout".to_string(),
                 };
                 let kind = classify::classify(&raw);
+                if kind == ErrorKind::IpFlagged {
+                    // circuit ouvert + cooldown amont prolongé : la gateway
+                    // a flaggé l'IP — marteler ne fait qu'aggraver le flag
+                    shared.antiban.flag();
+                }
                 {
                     let mut reg = shared.registry.lock().unwrap();
                     let cd = reg
@@ -937,11 +1064,17 @@ fn handle_chat(
                         .or_default()
                         .note_failure(kind, now);
                     eprintln!(
-                        "[pauvre-router] model={model} key={} kind={kind:?} cd={}s raw={}",
+                        "[pauvre-router] model={model} key={} kind={} cd={}s raw={}",
                         if api_key.is_some() { "pool" } else { "anon" },
+                        kind.label(),
                         cd.as_secs(),
                         raw.chars().take(160).collect::<String>()
                     );
+                }
+                if kind == ErrorKind::IpFlagged {
+                    if let Some(ra) = classify::cooldown_secs(&raw) {
+                        shared.antiban.cooldown_changed(ra);
+                    }
                 }
                 // clé invalidée seulement si le refus vient du compte (pas du modèle)
                 if let KeyChoice::Use(k) = &key_choice {
@@ -957,7 +1090,7 @@ fn handle_chat(
                 }
                 last_err = Some((
                     err_body(
-                        &format!("modele {model} indisponible ({kind:?})"),
+                        &format!("modele {model} indisponible ({})", kind.label()),
                         "upstream_error",
                         None,
                     ),
@@ -1254,6 +1387,7 @@ mod tests {
             gate_wait: Duration::from_millis(3),
             save_interval: Duration::from_secs(9),
             mode: "roundrobin".into(),
+            antiban_budget: 10_000,
         };
         let shared = Shared::new(&cfg);
         assert_eq!(shared.call_timeout, Duration::from_millis(10));

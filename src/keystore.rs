@@ -147,6 +147,7 @@ impl KeyStore {
         let reason = match kind {
             ErrorKind::Exhausted => "quota/limite",
             ErrorKind::ModelInvalid => "modele refuse",
+            ErrorKind::IpFlagged => "ip flaggee amont",
             ErrorKind::Transient => "erreur reseau",
         }
         .to_string();

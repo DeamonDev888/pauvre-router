@@ -8,6 +8,7 @@
 //! - cascade de fallback vers les modèles frontière disponibles
 //! - cache de déduplication des prompts identiques
 //! - état de santé persistant entre les redémarrages
+pub mod antiban;
 pub mod backend;
 pub mod cache;
 pub mod classify;

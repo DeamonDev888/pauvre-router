@@ -3,6 +3,34 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.7.5] — 2026-10-19
+
+### Ajouté
+- **Module anti-ban** (`src/antiban.rs`) — la leçon de l'incident du 18 oct 2026
+  (IPs VPN ET maison flaggées « abusive traffic » ~24 h par la gateway Zen après
+  ~800 messages/jour en anonyme) :
+  - **Budget global d'appels backend** : 30/min par défaut (env `PAUVRE_BUDGET`,
+    plancher 6, fenêtre glissante 60 s) — au-delà, 429 immédiat au client,
+    **aucun spawn** opencode. L'anti-spam existant bornait par IP cliente ;
+    rien ne bornait le flux TOTAL vers l'amont.
+  - **Circuit breaker flag IP** : la bannière « free models aren't available /
+    abusive traffic » (nouveau `ErrorKind::IpFlagged`, classée AVANT
+    ModelInvalid qui matchait « not available ») ouvre un circuit 10 min —
+    tout appel backend refusé sans spawn (marteler une gateway qui a flaggé
+    l'IP ne fait qu'aggraver le flag). Un `retry after N` amont prolonge la
+    coupure (×2, plafonné) ; un succès backend referme le circuit.
+  - **`GET /admin/antiban`** : budget, appels de la fenêtre, flag, secondes
+    de circuit restantes (aussi embarqué dans `/admin/stats`).
+  - **`POST /admin/antiban`** : `{"budget":N}` à chaud (plancher 6),
+    `{"release":true}` — levier opérateur après changement de réseau
+    (VPN off, autre IP) pour sortir du circuit sans attendre la sonde.
+  - Cooldown modèle `IpFlagged` court (90 s, sans backoff) : l'arrêt global
+    est porté par le circuit, la cascade n'empile plus 4 backoff géants.
+  - Endpoint admin `POST /admin/antiban` : changement de budget à chaud.
+- +9 tests (95 total) : budget/fenêtre, plancher, flag/circuit, prolongement
+  plafonné, ban IP vs ModelInvalid, extraction `retry after`, 3 E2E (budget
+  sans spawn, circuit ouvert/refermé, endpoint admin).
+
 ## [0.7.0] — 2026-10-17
 
 ### Ajouté

@@ -37,6 +37,19 @@ fn main() {
         return;
     }
 
+    if q.starts_with("FLAGGED") {
+        eprintln!(
+            "Error: OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address. This isn't related to your account. If you're on a VPN or proxy, turn it off and try again, or subscribe to OpenCode Go at https://opencode.ai/go to keep building."
+        );
+        std::process::exit(1);
+    }
+
+    if let Some(rest) = q.strip_prefix("COOLDOWN ") {
+        let secs: u64 = rest.trim().parse().unwrap_or(30);
+        eprintln!("Error: rate limit exceeded, retry after {secs} seconds");
+        std::process::exit(1);
+    }
+
     let fail_list = std::env::var("STUB_FAIL").unwrap_or_default();
     let should_fail = !fail_list.is_empty()
         && fail_list

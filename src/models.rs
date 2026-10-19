@@ -56,6 +56,9 @@ impl Health {
         let base = match kind {
             ErrorKind::Exhausted => COOLDOWN_EXHAUSTED,
             ErrorKind::ModelInvalid => COOLDOWN_MODEL_INVALID,
+            // flag IP : pause courte côté modèle — le circuit anti-ban
+            // impose déjà l'arrêt global (antiban::FLAGGED_PAUSE)
+            ErrorKind::IpFlagged => Duration::from_secs(90),
             ErrorKind::Transient => COOLDOWN_TRANSIENT,
         };
         // backoff x2 par récidive consécutive, plafonné
