@@ -3,6 +3,18 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.7.6] — 2026-10-19
+
+### Changé
+- **Cascade frontier mise à jour** (inventaire live de la gateway Zen : 86 modèles) :
+  - **`space-bunny-free` retiré** — disparu de la gateway, `UnknownError`
+    systématique (`jev-1.13-free`, apparu en même temps, est cassé aussi) ;
+  - **3 nouveaux free ajoutés et testés en direct** : `nemotron-3.5-lightning-free`
+    (~5 s), `longcat-2.5-preview-free` (~7 s), `mimo-v2.6-flash-free` (~7 s) ;
+  - la cascade passe de 4 à 6 frontières : plus de redondance, même budget
+    anti-ban (chaque requête n'en frappe qu'une avant de réussir).
+- +2 modèles exposés dans `/v1/models` (robin + 6).
+
 ## [0.7.5] — 2026-10-19
 
 ### Ajouté

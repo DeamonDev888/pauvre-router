@@ -13,11 +13,16 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 /// Modèles frontière retenus (les meilleurs gratuits testés en live).
 /// beam-free : le plus rapide (5,3 s) + 1M contexte — gratuit pour une
 /// durée limitée. glm-5.3-flash-free : frontière, gratuit depuis oct 2026.
-/// space-bunny : 5,7 s. deepseek-v4.1-flash : 9 s.
+/// nemotron-3.5-lightning : ~5 s. longcat-2.5-preview : ~7 s.
+/// mimo-v2.6-flash : ~7 s. deepseek-v4.1-flash : ~9 s.
+/// (space-bunny-free retiré le 19 oct 2026 : disparu de la gateway Zen,
+/// `UnknownError` systématique ; jev-1.13-free également cassé à l'arrivée.)
 pub const FREE_MODELS: &[&str] = &[
     "beam-free",
     "glm-5.3-flash-free",
-    "space-bunny-free",
+    "nemotron-3.5-lightning-free",
+    "longcat-2.5-preview-free",
+    "mimo-v2.6-flash-free",
     "deepseek-v4.1-flash-free",
 ];
 
@@ -356,8 +361,8 @@ mod tests {
 
     #[test]
     fn cascade_demande_dabord_puis_frontiere() {
-        let c = cascade("space-bunny-free");
-        assert_eq!(c[0], "space-bunny-free");
+        let c = cascade("deepseek-v4.1-flash-free");
+        assert_eq!(c[0], "deepseek-v4.1-flash-free");
         assert!(c.contains(&"glm-5.3-flash-free".to_string()));
         assert_eq!(c.len(), FREE_MODELS.len()); // pas de doublon
         let c2 = cascade("inconnu-xyz");

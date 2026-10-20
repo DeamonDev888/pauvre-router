@@ -98,11 +98,14 @@ fn call_at_passe_la_cle_api_au_spawn() {
 
 #[test]
 fn call_at_env_additionnelle_positionnee() {
-    let env = vec![("STUB_FAIL".to_string(), "space-bunny-free".to_string())];
+    let env = vec![(
+        "STUB_FAIL".to_string(),
+        "longcat-2.5-preview-free".to_string(),
+    )];
     // le modèle visé est dans la liste → échec ; un autre → OK
     let err = call_at(
         stub(),
-        "space-bunny-free",
+        "longcat-2.5-preview-free",
         "x",
         Duration::from_secs(10),
         None,

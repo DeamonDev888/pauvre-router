@@ -205,11 +205,11 @@ fn e2e_health_et_models() {
         .iter()
         .filter_map(|m| m["id"].as_str())
         .collect();
-    assert_eq!(ids.len(), 5, "robin + 4 frontieres: {ids:?}");
+    assert_eq!(ids.len(), 7, "robin + 6 frontieres: {ids:?}");
     assert!(ids.contains(&"frontier-robin-free"));
     assert!(ids.contains(&"beam-free"));
     assert!(ids.contains(&"glm-5.3-flash-free"));
-    assert!(ids.contains(&"space-bunny-free"));
+    assert!(ids.contains(&"longcat-2.5-preview-free"));
     assert!(ids.contains(&"deepseek-v4.1-flash-free"));
 }
 
@@ -253,7 +253,7 @@ fn e2e_chat_json_puis_cache_hit() {
 fn e2e_chat_sse_stream() {
     let i = start("sse", |_| {});
     let body = serde_json::json!({
-        "model": "space-bunny-free",
+        "model": "longcat-2.5-preview-free",
         "stream": true,
         "messages": [{"role": "user", "content": "PONG"}]
     });
@@ -279,7 +279,7 @@ fn e2e_chat_sse_stream() {
     assert!(raw.contains("data: [DONE]"));
     // le contenu est arrivé dans un delta
     assert!(
-        raw.contains("\"content\":\"ack opencode/space-bunny-free: PONG\""),
+        raw.contains("\"content\":\"ack opencode/longcat-2.5-preview-free: PONG\""),
         "{raw}"
     );
 }
@@ -338,7 +338,7 @@ fn e2e_cascade_fallback_sur_quota() {
         .unwrap_or_default();
     assert!(
         fallback.ends_with("beam-free")
-            || fallback.ends_with("space-bunny-free")
+            || fallback.ends_with("longcat-2.5-preview-free")
             || fallback.ends_with("deepseek-v4.1-flash-free"),
         "repondu par un modele de fallback, pas glm: '{served}'"
     );
@@ -354,13 +354,13 @@ fn e2e_cascade_fallback_sur_quota() {
 
 #[test]
 fn e2e_tous_en_cooldown_429() {
-    // STUB_FAIL = les 3 modèles → chaque tentative échoue en exhaustion,
+    // STUB_FAIL = les 6 modèles → chaque tentative échoue en exhaustion,
     // la chaîne entière brûle → 502 ; puis tout est en cooldown → 429.
     let i = start("cooldown-all", |c| {
-        c.backend_env = vec![(
+        c.backend_env = vec![((
             "STUB_FAIL".into(),
-            "beam-free,glm-5.3-flash-free,space-bunny-free,deepseek-v4.1-flash-free".into(),
-        )];
+            "beam-free,glm-5.3-flash-free,nemotron-3.5-lightning-free,longcat-2.5-preview-free,mimo-v2.6-flash-free,deepseek-v4.1-flash-free".into(),
+        ))];
     });
     let (code1, v1) = chat(i.port, "glm-5.3-flash-free", "PONG one").unwrap();
     assert_eq!(code1, 502, "toute la chaîne échoue: {v1}");
@@ -368,7 +368,9 @@ fn e2e_tous_en_cooldown_429() {
     for m in [
         "beam-free",
         "glm-5.3-flash-free",
-        "space-bunny-free",
+        "nemotron-3.5-lightning-free",
+        "longcat-2.5-preview-free",
+        "mimo-v2.6-flash-free",
         "deepseek-v4.1-flash-free",
     ] {
         assert!(
@@ -377,7 +379,7 @@ fn e2e_tous_en_cooldown_429() {
         );
     }
     // requête suivante : tous en cooldown → 429 sans même spawn le stub
-    let (code2, v2) = chat(i.port, "space-bunny-free", "PONG two").unwrap();
+    let (code2, v2) = chat(i.port, "longcat-2.5-preview-free", "PONG two").unwrap();
     assert_eq!(code2, 429, "attendu 429 tous-cooldowns: {v2}");
     let msg = v2["error"]["message"].as_str().unwrap_or_default();
     assert!(msg.contains("cooldown"), "msg={msg}");
@@ -430,14 +432,14 @@ fn e2e_backend_timeout_devient_502_ou_fallback() {
     // SLOW 5000 > call_timeout (1.5s) : le modèle visé timeout → soit un
     // fallback sert la requête, soit 502 si toute la chaîne brûle.
     let i = start("timeout", |c| {
-        c.backend_env = vec![("STUB_FAIL".into(), "space-bunny-free".into())];
+        c.backend_env = vec![("STUB_FAIL".into(), "longcat-2.5-preview-free".into())];
     });
-    let (code, v) = chat(i.port, "space-bunny-free", "SLOW 5000").unwrap();
+    let (code, v) = chat(i.port, "longcat-2.5-preview-free", "SLOW 5000").unwrap();
     assert!(code == 200 || code == 502, "code inattendu {code}: {v}");
     if code == 200 {
         let served = chat_content(&v);
         assert!(
-            !served.contains("space-bunny-free"),
+            !served.contains("longcat-2.5-preview-free"),
             "space-bunny doit être en cooldown, pas servir: {served}"
         );
     }
@@ -709,7 +711,7 @@ fn e2e_requetes_concurrentes_toutes_servies() {
     for n in 0..12 {
         let port = i.port;
         handles.push(std::thread::spawn(move || {
-            chat(port, "space-bunny-free", &format!("PONG c{n}")).unwrap()
+            chat(port, "longcat-2.5-preview-free", &format!("PONG c{n}")).unwrap()
         }));
     }
     let mut oks = 0;
