@@ -205,7 +205,7 @@ fn e2e_health_et_models() {
         .iter()
         .filter_map(|m| m["id"].as_str())
         .collect();
-    assert_eq!(ids.len(), 7, "robin + 6 frontieres: {ids:?}");
+    assert_eq!(ids.len(), 8, "robin + 7 frontieres: {ids:?}");
     assert!(ids.contains(&"frontier-robin-free"));
     assert!(ids.contains(&"beam-free"));
     assert!(ids.contains(&"glm-5.3-flash-free"));
@@ -359,7 +359,7 @@ fn e2e_tous_en_cooldown_429() {
     let i = start("cooldown-all", |c| {
         c.backend_env = vec![(
             "STUB_FAIL".into(),
-            "beam-free,glm-5.3-flash-free,nemotron-3.5-lightning-free,longcat-2.5-preview-free,mimo-v2.6-flash-free,deepseek-v4.1-flash-free".into(),
+            "beam-free,glm-5.3-flash-free,nemotron-3.5-lightning-free,longcat-2.5-preview-free,mimo-v2.6-flash-free,minimax-m3.1-flash-free,deepseek-v4.1-flash-free".into(),
         )];
     });
     let (code1, v1) = chat(i.port, "glm-5.3-flash-free", "PONG one").unwrap();
@@ -371,6 +371,7 @@ fn e2e_tous_en_cooldown_429() {
         "nemotron-3.5-lightning-free",
         "longcat-2.5-preview-free",
         "mimo-v2.6-flash-free",
+        "minimax-m3.1-flash-free",
         "deepseek-v4.1-flash-free",
     ] {
         assert!(
