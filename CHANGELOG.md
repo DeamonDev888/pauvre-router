@@ -3,6 +3,22 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.7.7] — 2026-10-20
+
+### Corrigé
+- **413 qui devenait « Connection error »** : un corps dépassant la limite
+  recevait un 413 sans que le serveur lise le body — les octets restants
+  frappaient un socket fermé → RST → le client (SDK OpenAI/Hermes) voyait
+  une `APIConnectionError` au lieu du vrai diagnostic. Le serveur draine
+  maintenant le corps (borne 64 Mo, timeout de drain 2 s) AVANT de répondre
+  413 proprement.
+- **`MAX_BODY` 1,5 Mo → 8 Mo** : une session Hermes de ~850 messages
+  (~1,2-1,5 Mo de JSON) frappait l'ancienne limite de façon intermittente —
+  c'était la cause des « Connection error » instantanés (23 ms) suivis d'un
+  fallback forcé sur un autre provider.
+- +2 tests E2E : session de 850 messages (≈2 Mo) qui passe entière, 413
+  propre sur 9 Mo sans RST (97 tests total).
+
 ## [0.7.6] — 2026-10-19
 
 ### Changé

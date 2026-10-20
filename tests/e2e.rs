@@ -653,9 +653,9 @@ fn e2e_keepalive_3_requetes_meme_socket() {
 
 #[test]
 fn e2e_corps_trop_grand_413() {
-    // MAX_BODY = 1.5 Mo : on envoie 1.6 Mo
+    // MAX_BODY = 8 Mo : on envoie 9 Mo — le serveur draine puis répond 413
     let i = start("413", |_| {});
-    let big = vec![b'x'; 1_600_000];
+    let big = vec![b'x'; 9_000_000];
     let mut s = std::net::TcpStream::connect(("127.0.0.1", i.port)).unwrap();
     s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -784,6 +784,71 @@ fn e2e_cache_clear_recalcule() {
         stats["stats"]["ok_total"].as_u64().unwrap_or(0) >= 2,
         "2 calculs réels attendus: {stats}"
     );
+}
+
+#[test]
+fn e2e_body_trop_grand_413_propre_sans_rst() {
+    // Un corps > MAX_BODY doit recevoir un 413 JSON lisible — PAS un reset
+    // TCP (le serveur draine le body avant de répondre ; un RST ici fait
+    // croire à Hermes/OpenAI « Connection error » au lieu du vrai diagnostic).
+    let i = start("body413", |_| {});
+    let big = vec![b'a'; 9_000_000]; // 9 Mo > 8 Mo
+    let body = format!(
+        "{{\"model\":\"beam-free\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}]}}",
+        String::from_utf8_lossy(&big)
+    );
+    // lecture brute : un RST remontrait comme erreur io, pas comme status
+    let (code, raw) = req(
+        i.port,
+        "POST",
+        "/v1/chat/completions",
+        body.as_bytes(),
+        false,
+    )
+    .expect("la requete ne doit PAS etre rejetee au niveau TCP");
+    assert_eq!(code, 413, "413 attendu: {raw}");
+    assert!(
+        raw.contains("body trop grand"),
+        "message 413 attendu: {raw}"
+    );
+    // le serveur reste vivant et sain après le drain
+    let (h, _) = req(i.port, "GET", "/health", b"", false).unwrap();
+    assert_eq!(h, 200);
+}
+
+#[test]
+fn e2e_body_lourd_848_messages_passe() {
+    // Une session Hermes chargée (centaines de messages ≈ 2 Mo de JSON)
+    // doit passer entière — l'ancienne limite 1,5 Mo la rejetait.
+    let i = start("bodygros", |_| {});
+    let filler = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ".repeat(16);
+    let messages: Vec<serde_json::Value> = (0..850)
+        .map(|n| {
+            serde_json::json!({
+                "role": if n % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("message de session numero {n}: {filler}"),
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "model": "beam-free",
+        "messages": messages,
+    });
+    let raw = body.to_string();
+    assert!(
+        raw.len() > 1_500_000,
+        "le corps doit depasser lancienne limite: {}",
+        raw.len()
+    );
+    let (code, v) = req(
+        i.port,
+        "POST",
+        "/v1/chat/completions",
+        raw.as_bytes(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(code, 200, "2 Mo de session doivent passer: {v}");
 }
 
 // ---------------------------------------------------------------------

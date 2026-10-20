@@ -176,7 +176,31 @@ impl HttpConn {
                 headers.push((k, v));
             }
         }
-        if content_length > max_body && !chunked {
+        // Body trop grand : ne PAS répondre tout de suite. Si on renvoie le
+        // 413 sans lire le body, les octets restants restent en route vers un
+        // socket qu'on ferme aussitôt → RST → le client voit « Connection
+        // error » au lieu du 413 (vu en prod : sessions Hermes de ~850
+        // messages frappant la limite de façon intermittente). On lit et
+        // jette le body (borne anti-DoS : 64 Mo), PUIS on répond.
+        let oversized = content_length > max_body;
+        if oversized && !chunked {
+            // drain rapide : 2 s de silence = client mort/parti — on ne
+            // traîne pas (le READ_TIMEOUT de 120 s ne s'applique pas ici)
+            let _ = self
+                .reader
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(2)));
+            let mut remaining = content_length.min(64 * 1024 * 1024);
+            let mut sink = [0u8; 16384];
+            while remaining > 0 {
+                let n = remaining.min(sink.len());
+                match self.reader.read(&mut sink[..n]) {
+                    Ok(0) => break,
+                    Ok(_) => remaining -= n,
+                    Err(_) => break,
+                }
+            }
+            let _ = self.reader.get_ref().set_read_timeout(Some(READ_TIMEOUT));
             return Err(HttpError::TooLarge);
         }
 

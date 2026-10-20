@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-const MAX_BODY: usize = 1_500_000; // 1.5 Mo
+const MAX_BODY: usize = 8_000_000; // 8 Mo — sessions Hermes lourdes (848 messages ≈ 1.2-1.5 Mo de JSON)
 const KEY_BACKOFF: u64 = 1800; // cooldown clé après échec (30 min)
 const N_WORKERS: usize = 8; // workers fixes — LA réponse anti-zombie
 const QUEUE_CAP: usize = 64; // file de connexions en attente
