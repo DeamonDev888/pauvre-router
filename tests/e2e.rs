@@ -357,10 +357,10 @@ fn e2e_tous_en_cooldown_429() {
     // STUB_FAIL = les 6 modèles → chaque tentative échoue en exhaustion,
     // la chaîne entière brûle → 502 ; puis tout est en cooldown → 429.
     let i = start("cooldown-all", |c| {
-        c.backend_env = vec![((
+        c.backend_env = vec![(
             "STUB_FAIL".into(),
             "beam-free,glm-5.3-flash-free,nemotron-3.5-lightning-free,longcat-2.5-preview-free,mimo-v2.6-flash-free,deepseek-v4.1-flash-free".into(),
-        ))];
+        )];
     });
     let (code1, v1) = chat(i.port, "glm-5.3-flash-free", "PONG one").unwrap();
     assert_eq!(code1, 502, "toute la chaîne échoue: {v1}");
