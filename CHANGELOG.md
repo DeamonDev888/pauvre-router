@@ -3,6 +3,26 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.7.8] — 2026-10-20
+
+### Corrigé
+- **Pollution du backend par le system prompt du client** (audit 20 oct) :
+  Hermes transmet son system prompt ENTIER (listes de skills, directives
+  mémoire, marqueurs de steering — 15-40k chars). Le modèle backend
+  obéissait à ces instructions et tentait d'invoquer des mécanismes
+  inexistants dans opencode → `✗ Skill "pauvre-router" failed — Error:
+  Skill not found` sur CHAQUE appel (3 échecs minimax, 4 deepseek vus en
+  prod), brûlant la cascade entière — d'où les « 60 s sans premier chunk »
+  côté client. Deux garde-fous :
+  - **`MAX_SYS_CHARS` 6000** : la consigne système est tronquée (début
+    conservé = persona + instructions principales, marqueur de troncature
+    ajouté) — le bloc de skills du client ne transite plus ;
+  - **Règle FRONTIÈRE D'ENVIRONNEMENT** (mode tools) : le backend est
+    informé que la consigne vient d'un AUTRE agent et que tout ce qui
+    n'est pas dans SES outils (skills, skill_view, memory, cron,
+    sous-agents…) n'existe pas ici — n'invoquer JAMAIS ces mécanismes.
+- +2 tests (99 total).
+
 ## [0.7.7] — 2026-10-20
 
 ### Corrigé
