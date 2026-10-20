@@ -6,7 +6,7 @@
 
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Timeouts par défaut (côté serveur).
 pub const READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -184,19 +184,28 @@ impl HttpConn {
         // jette le body (borne anti-DoS : 64 Mo), PUIS on répond.
         let oversized = content_length > max_body;
         if oversized && !chunked {
-            // drain rapide : 2 s de silence = client mort/parti — on ne
-            // traîne pas (le READ_TIMEOUT de 120 s ne s'applique pas ici)
+            // drain avec DEADLINE TOTALE (pas par read) : sur une machine
+            // chargée, le body peut arriver en retard — un timeout par read
+            // abandonnait le drain avec des Mo non lus → RST au close
+            // (vu sur la CI Linux/macOS). On poll toutes les 250 ms,
+            // 10 s max au total, puis on répond 413 quoi qu'il arrive.
+            let deadline = Instant::now() + Duration::from_secs(10);
             let _ = self
                 .reader
                 .get_ref()
-                .set_read_timeout(Some(Duration::from_secs(2)));
+                .set_read_timeout(Some(Duration::from_millis(250)));
             let mut remaining = content_length.min(64 * 1024 * 1024);
             let mut sink = [0u8; 16384];
-            while remaining > 0 {
-                let n = remaining.min(sink.len());
-                match self.reader.read(&mut sink[..n]) {
+            while remaining > 0 && Instant::now() < deadline {
+                match self.reader.read(&mut sink) {
                     Ok(0) => break,
-                    Ok(_) => remaining -= n,
+                    Ok(n) => remaining -= n,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        continue; // pas de données ENCORE : on re-poll
+                    }
                     Err(_) => break,
                 }
             }
