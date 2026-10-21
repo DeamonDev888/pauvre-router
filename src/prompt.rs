@@ -137,6 +137,31 @@ pub fn compose_prompt(messages: &serde_json::Value, has_tools: bool) -> Result<S
     }
 }
 
+/// Texte du DERNIER message user (la « question »), sans les system ni
+/// l'historique — même extraction de contenu que [`compose_prompt`].
+pub fn last_user_text(messages: &serde_json::Value) -> Option<String> {
+    let arr = messages.as_array()?;
+    let mut last: Option<String> = None;
+    for m in arr {
+        if m.get("role").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+        let text = match m.get("content") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        if !text.is_empty() {
+            last = Some(text);
+        }
+    }
+    last
+}
+
 /// Extrait le répertoire de travail du client depuis les messages system.
 /// Hermes le déclare sous des formes variées (« Working directory: X »,
 /// « cwd: X », « Current working directory: X »). Retourne None sinon.

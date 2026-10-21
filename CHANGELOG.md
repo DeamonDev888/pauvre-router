@@ -3,6 +3,18 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.8.4] — 2026-10-21
+
+### Corrigé
+- **Workdir du client écrasait l'auto-référence** : « audit du router des
+  pauvre » passait le cwd du CLIENT comme répertoire de travail — l'agent
+  backend auditait `mcp-command-center` (fichiers ui-e2e, commit
+  « fix(ui) v0.6.5 ») au lieu du service. Découverte du repo du service
+  au boot (`discover_self_repo` : remontée depuis current_exe vers le
+  Cargo.toml « pauvre-router ») : si la DERNIÈRE question user mentionne
+  « pauvre » / « pauvre-router », le workdir du service ÉCRASE celui du
+  client. Hors auto-référence, le workdir client reste respecté.
+
 ## [0.8.3] — 2026-10-21
 
 ### Corrigé

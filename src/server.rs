@@ -121,6 +121,10 @@ pub struct Shared {
     pub backend_exe_cell: Mutex<Option<String>>,
     /// Anti-ban : budget global + circuit breaker flag IP.
     pub antiban: crate::antiban::AntiBan,
+    /// Repo du service lui-même (découvert depuis current_exe au boot) —
+    /// pour router les demandes auto-référentielles (« audit du pauvre
+    /// router ») vers le VRAI repo au lieu du cwd du client.
+    pub self_repo: Option<String>,
 }
 
 impl Shared {
@@ -143,8 +147,27 @@ impl Shared {
             backend_exe_cell: Mutex::new(Some(cfg.backend_exe.clone())),
             updater: Arc::new(Updater::new(VERSION.to_string())),
             antiban: crate::antiban::AntiBan::new(cfg.antiban_budget),
+            self_repo: discover_self_repo(),
         }
     }
+}
+
+/// Remonte depuis current_exe (…/pauvre-router/target/release/…) vers un
+/// Cargo.toml contenant « pauvre-router » = le repo du service lui-même.
+/// None si le binaire tourne hors de son repo (installé ailleurs).
+fn discover_self_repo() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?.to_path_buf();
+    for _ in 0..6 {
+        let cargo = dir.join("Cargo.toml");
+        if let Ok(txt) = std::fs::read_to_string(&cargo) {
+            if txt.contains("pauvre-router") {
+                return Some(dir.to_string_lossy().to_string());
+            }
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
 }
 
 /// File de connexions bornée (producteur = accept, consommateurs = workers).
@@ -870,6 +893,24 @@ fn handle_chat(
         .map(|a| !a.is_empty())
         .unwrap_or(false);
     let workdir = extract_workdir(&messages);
+    // Auto-référence : « audit du pauvre router » avec le cwd du CLIENT
+    // pointait l'agent sur le repo du client (vu en prod : il auditait
+    // mcp-command-center). Si la question désigne CE service et que le
+    // repo du service est connu, on IMPOSE son répertoire.
+    let workdir = {
+        let mentions_self = crate::prompt::last_user_text(&messages)
+            .map(|q| {
+                let l = q.to_lowercase();
+                l.contains("pauvre")
+                    || l.contains("pauvre-router")
+                    || l.contains("router des pauvres")
+            })
+            .unwrap_or(false);
+        match (&shared.self_repo, mentions_self) {
+            (Some(repo), true) => Some(repo.clone()),
+            _ => workdir,
+        }
+    };
     let prompt = match compose_prompt(&messages, has_tools) {
         Ok(p) => p,
         Err(e) => {
