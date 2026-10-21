@@ -232,7 +232,7 @@ fn parse_workdir_line(line: &str) -> Option<String> {
         "current working directory:",
     ];
     for mk in markers {
-        if let Some(rest) = l.to_lowercase().find(mk) {
+        if let Some(rest) = find_marker(l, mk) {
             let v = l[rest + mk.len()..].trim();
             // élaguer ponctuation de fin (point, guillemets)
             let v = v.trim_end_matches(['.', ',', '"', '\'']);
@@ -240,6 +240,48 @@ fn parse_workdir_line(line: &str) -> Option<String> {
                 return Some(v.to_string());
             }
         }
+    }
+    None
+}
+
+/// Recherche d'un marqueur dans `line`, en ignorant la casse, SANS
+/// changer les offsets de la chaîne d'ORIGINE.
+///
+/// Pourquoi pas `line.to_lowercase().find(mk)` : `to_lowercase` peut
+/// CHANGER LA LONGUEUR EN OCTETS (İ U+0130 → 3 octets, K Kelvin
+/// U+212A → 1 octet, ß → « ss »). L'offset alors calculé ne vaut pas
+/// sur la chaîne d'origine : on slicingait au mauvais endroit
+/// (« cwd: ».shifté d'un octet → chemin faux) ou HORS DES BOITES
+/// (« start byte index 13 is out of bounds ») → PANIC. Le system
+/// prompt est une DONNÉE D'ENTRÉE (n'importe quel client peut
+/// l'envoyer) : ce panic tuait le thread worker, définitivement (le
+/// pool de workers est fixe) — 8 requêtes suffisaient à rendre le
+/// service muet. Ici on compare octet par octet sur l'original : les
+/// lettres ASCII sont insensibles à la casse, les octets non-ASCII
+/// (le « é » du marqueur français) sont comparés tels quels.
+fn find_marker(line: &str, marker: &str) -> Option<usize> {
+    let h = line.as_bytes();
+    let m = marker.as_bytes();
+    if m.is_empty() || h.len() < m.len() {
+        return None;
+    }
+    'cand: for i in 0..=h.len() - m.len() {
+        for (j, &mb) in m.iter().enumerate() {
+            let hb = h[i + j];
+            let ok = if mb.is_ascii_alphabetic() {
+                hb.eq_ignore_ascii_case(&mb)
+            } else {
+                hb == mb
+            };
+            if !ok {
+                continue 'cand;
+            }
+        }
+        // le slice doit tomber sur des frontières de caractères
+        if !line.is_char_boundary(i) || !line.is_char_boundary(i + m.len()) {
+            continue;
+        }
+        return Some(i);
     }
     None
 }
@@ -393,6 +435,37 @@ mod tests {
         let i_f = p.find("FRONTIÈRE").unwrap();
         let i_q = p.find("[Question]").unwrap();
         assert!(i_sys < i_f && i_f < i_q, "p={p}");
+    }
+
+    #[test]
+    fn workdir_marker_unicode_sans_panique() {
+        // Régression : avant, l'offset du marqueur était calculé sur la
+        // version MINUSCULE de la ligne puis appliqué à l'original —
+        // to_lowercase() change la longueur en octets sur certains
+        // caractères → slice hors bornes → PANIC (worker mort).
+        for line in [
+            "\u{0130}\u{0130}\u{0130}cwd: C:\\Users\\x", // İ x3 : +1 octet chacun
+            "KKKKcwd: C:\\Users\\x",                     // K Kelvin x4 : -2 octets chacun
+            "\u{00DF}cwd: C:\\Users\\x",                 // ß → « ss »
+            "\u{1E9E}cwd: C:\\Users\\x",                 // ẞ → « ss »
+            "\u{0130}Working directory: C:\\Users\\x",
+        ] {
+            let _ = parse_workdir_line(line); // ne doit PAS paniquer
+        }
+        // le chemin ASCII reste extrait correctement (non-régression)
+        assert_eq!(
+            parse_workdir_line("Working directory: C:\\repo"),
+            Some("C:\\repo".into())
+        );
+        assert_eq!(
+            parse_workdir_line("cwd: /tmp/work"),
+            Some("/tmp/work".into())
+        );
+        assert_eq!(
+            parse_workdir_line("Répertoire de travail : C:\\repo"),
+            Some("C:\\repo".into()),
+            "le marqueur français doit toujours matcher"
+        );
     }
 
     #[test]

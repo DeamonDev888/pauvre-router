@@ -36,6 +36,12 @@ const KEY_BACKOFF: u64 = 1800; // cooldown clé après échec (30 min)
 const N_WORKERS: usize = 8; // workers fixes — LA réponse anti-zombie
 const QUEUE_CAP: usize = 64; // file de connexions en attente
 
+/// Token d'administration par défaut (endpoint `/admin/*`). Surchargeable
+/// par l'env `PAUVRE_ADMIN_TOKEN`. « pauvre » = la convention déjà
+/// utilisée par Hermes (`api_key: pauvre`) et par la consigne injectée
+/// au backend (src/prompt.rs).
+pub const DEFAULT_ADMIN_TOKEN: &str = "pauvre";
+
 /// Tout ce que le serveur lit hors du code. `ServerConfig::production()`
 /// reproduit exactement le comportement historique du binaire ; les tests
 /// E2E construisent la leur (port 0, tmpdir, stub, timings courts).
@@ -62,6 +68,10 @@ pub struct ServerConfig {
     pub mode: String,
     /// Anti-ban : budget d'appels backend/min (fenêtre glissante 60 s).
     pub antiban_budget: usize,
+    /// Token d'administration (Bearer) exigé sur `/admin/*`. Vide = auth
+    /// désactivée (déconseillé : les endpoints admin pilotent le pool de
+    /// clés, l'anti-ban et le cache).
+    pub admin_token: String,
 }
 
 impl ServerConfig {
@@ -91,6 +101,10 @@ impl ServerConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(crate::antiban::DEFAULT_BUDGET),
+            admin_token: std::env::var("PAUVRE_ADMIN_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_ADMIN_TOKEN.to_string()),
         }
     }
 }
@@ -104,6 +118,10 @@ pub struct Shared {
     pub registry: Mutex<Registry>,
     pub stats: Mutex<Stats>,
     pub in_flight: AtomicU64,
+    /// Panics isolés dans la boucle des workers (observabilité : un
+    /// compteur qui monte = autant de requêtes qui ont fait tomber le
+    /// worker, sans tuer le service).
+    pub panics: AtomicU64,
     pub spam_log: Mutex<Vec<(String, u64)>>,
     pub keystore: Mutex<KeyStore>,
     /// Mode de routage : "priority" | "roundrobin".
@@ -121,6 +139,8 @@ pub struct Shared {
     pub backend_exe_cell: Mutex<Option<String>>,
     /// Anti-ban : budget global + circuit breaker flag IP.
     pub antiban: crate::antiban::AntiBan,
+    /// Token d'administration (Bearer) exigé sur `/admin/*`.
+    pub admin_token: String,
     /// Repo du service lui-même (découvert depuis current_exe au boot) —
     /// pour router les demandes auto-référentielles (« audit du pauvre
     /// router ») vers le VRAI repo au lieu du cwd du client.
@@ -137,6 +157,7 @@ impl Shared {
             registry: Mutex::new(Registry::new()),
             stats: Mutex::new(Stats::default()),
             in_flight: AtomicU64::new(0),
+            panics: AtomicU64::new(0),
             spam_log: Mutex::new(Vec::new()),
             keystore: Mutex::new(KeyStore::open(cfg.keys_path.clone())),
             mode: Mutex::new(cfg.mode.clone()),
@@ -147,6 +168,7 @@ impl Shared {
             backend_exe_cell: Mutex::new(Some(cfg.backend_exe.clone())),
             updater: Arc::new(Updater::new(VERSION.to_string())),
             antiban: crate::antiban::AntiBan::new(cfg.antiban_budget),
+            admin_token: cfg.admin_token.clone(),
             self_repo: discover_self_repo(),
         }
     }
@@ -186,17 +208,19 @@ impl Queue {
 
     /// Bloque jusqu'à une connexion disponible.
     fn pop(&self) -> TcpStream {
-        let mut q = self.inner.lock().unwrap();
+        // verrous poison-tolérants : un mutex empoisonné (panic survenu
+        // ailleurs) ne doit pas condamner la file entière.
+        let mut q = crate::lock(&self.inner);
         loop {
             if let Some(s) = q.pop_front() {
                 return s;
             }
-            q = self.cv.wait(q).unwrap();
+            q = self.cv.wait(q).unwrap_or_else(|e| e.into_inner());
         }
     }
 
     fn push(&self, s: TcpStream) -> bool {
-        let mut q = self.inner.lock().unwrap();
+        let mut q = crate::lock(&self.inner);
         if q.len() >= QUEUE_CAP {
             return false; // saturation : on referme (backpressure)
         }
@@ -214,6 +238,18 @@ fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
+/// Compteur « appels en vol » : décrémenté à la DROP (RAII). Un retour
+/// anticipé OU un panic ne peut donc plus laisser `in_flight` collé
+/// (le compteur est affiché par `/health` et `/admin/stats` : un
+/// compteur figé fait croire à une saturation imaginaire).
+struct InFlight<'a>(&'a AtomicU64);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn err_body(msg: &str, kind: &str, retry_after: Option<u64>) -> serde_json::Value {
     let mut e = serde_json::json!({
         "error": {"message": msg, "type": kind}
@@ -222,6 +258,39 @@ fn err_body(msg: &str, kind: &str, retry_after: Option<u64>) -> serde_json::Valu
         e["error"]["retry_after"] = serde_json::json!(ra);
     }
     e
+}
+
+/// Le chemin cible-t-il l'espace d'administration ?
+/// (`/admin` et `/admin/...` — pas `/administrateur`).
+pub fn is_admin_path(path: &str) -> bool {
+    path == "/admin" || path.starts_with("/admin/")
+}
+
+/// Le token d'administration est-il valide pour cette requête ?
+/// Schéma `Authorization: Bearer <token>` (RFC 7235, schéma insensible
+/// à la casse). Token vide = auth désactivée explicitement.
+/// Comparaison à temps constant : on ne révèle pas le préfixe correct
+/// par un retour anticipé.
+fn admin_authorized(req: &Request, token: &str) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+    let header = req.header("authorization").unwrap_or("").trim();
+    let mut parts = header.split_whitespace();
+    let scheme = parts.next().unwrap_or("");
+    let value = parts.next().unwrap_or("").trim();
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    let (a, b) = (value.as_bytes(), token.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn completion_body(text: &str, model: &str) -> serde_json::Value {
@@ -416,6 +485,33 @@ fn route_request(
         return;
     }
 
+    // ---- garde admin : token Bearer obligatoire sur /admin/* ----
+    // Sans ce garde, n'importe quel PROCESSUS local — et surtout
+    // n'importe quel SITE WEB ouvert dans le navigateur (POST
+    // cross-origin « simple », sans preflight) — peut piloter le
+    // service : `POST /admin/antiban {"release":true}` désactive la
+    // protection anti-ban (celle qui existe depuis l'incident de ban
+    // IP de 24 h du 18 oct 2026), `/admin/keys/add` injecte une clé,
+    // `/admin/reset` vide cache + cooldowns. L'en-tête Authorization
+    // est de plus refusé par le navigateur en cross-origin (preflight
+    // → bloqué) : le CSRF « drive-by » est fermé.
+    if path.starts_with("/admin") && !admin_authorized(&req, &shared.admin_token) {
+        let b = err_body(
+            "token admin invalide ou absent (Authorization: Bearer <token>)",
+            "permission_error",
+            None,
+        );
+        let _ = conn.write_response(
+            401,
+            "Unauthorized",
+            "application/json",
+            b.to_string().as_bytes(),
+            &[("WWW-Authenticate", "Bearer")],
+            keep,
+        );
+        return;
+    }
+
     // ---- endpoints lecture ----
     if req.method == "GET" && (path == "/health" || path == "/v1/health") {
         let upd = shared.updater.status();
@@ -423,8 +519,9 @@ fn route_request(
             "status": "ok",
             "router": "pauvre-router",
             "version": VERSION,
-            "mode": shared.mode.lock().unwrap().clone(),
+            "mode": crate::lock(&shared.mode).clone(),
             "in_flight": shared.in_flight.load(Ordering::Relaxed),
+            "panics": shared.panics.load(Ordering::Relaxed),
             "update": {
                 "available": upd.update_available,
                 "latest": upd.latest,
@@ -732,6 +829,7 @@ fn admin_stats(conn: &mut HttpConn, shared: &Arc<Shared>, keep: bool) {
         "keys": keys_meta,
         "mode": mode,
         "in_flight": shared.in_flight.load(Ordering::Relaxed),
+        "panics": shared.panics.load(Ordering::Relaxed),
         "antiban": {
             "budget_per_min": shared.antiban.budget(),
             "backend_calls_this_window": antiban_used,
@@ -1014,6 +1112,9 @@ fn handle_chat(
         }
     };
     shared.in_flight.fetch_add(1, Ordering::Relaxed);
+    // garde RAII : le compteur redescend à la sortie de la fonction,
+    // quel que soit le chemin (succès, erreur, retour anticipé, panic)
+    let _inflight = InFlight(&shared.in_flight);
 
     // 5) cascade (robin = toute la chaîne frontière)
     let chain = cascade(&model_req);
@@ -1098,7 +1199,6 @@ fn handle_chat(
                             keep,
                         );
                     }
-                    shared.in_flight.fetch_sub(1, Ordering::Relaxed);
                     return;
                 }
             }
@@ -1216,7 +1316,10 @@ fn handle_chat(
                         keep,
                     );
                 }
-                shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+                // in_flight : la garde RAII `_inflight` le décrémente à la
+                // sortie de la fonction (succès, erreur ou panic) — NE PAS
+                // le faire aussi ici : double décrément => compteur wrapping
+                // en u64::MAX dans /health.
                 return;
             }
             Err(be) => {
@@ -1281,7 +1384,8 @@ fn handle_chat(
             }
         }
     }
-    shared.in_flight.fetch_sub(1, Ordering::Relaxed);
+    // in_flight : décrémenté par la garde RAII `_inflight` (à la sortie de
+    // la fonction) — pas de double décrément ici.
     let (b, code) = last_err.unwrap_or_else(|| {
         (
             err_body("aucun modele disponible", "upstream_error", None),
@@ -1419,7 +1523,25 @@ pub fn bind_server(cfg: &ServerConfig) -> std::io::Result<BoundServer> {
                     .peer_addr()
                     .map(|a| a.ip())
                     .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
-                serve_conn(stream, peer, &s);
+                // ISOLATION DU PANIC : le pool est FIXE (8 threads) — un
+                // panic dans le traitement d'une requête (entrée client
+                // NON FIABLE : system prompt arbitraire, JSON malformé)
+                // tuait le thread pour TOUJOURS. 8 panics = service
+                // muet (file pleine, connexions refermées) alors que le
+                // binaire tournait encore. Le bug d'offset UTF-8 de
+                // `parse_workdir_line` (8 requêtes suffisaient) l'a
+                // prouvé en prod. Ici le panic est isolé : le worker
+                // survit, la connexion concernée est refermée, le
+                // compteur `panics` monte (visible dans /health).
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    serve_conn(stream, peer, &s);
+                }));
+                if res.is_err() {
+                    s.panics.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[pauvre-router] panic isolé dans le worker {id} — worker vivant, service intact"
+                    );
+                }
             })
             .expect("spawn worker");
     }
@@ -1568,6 +1690,7 @@ mod tests {
             save_interval: Duration::from_secs(9),
             mode: "roundrobin".into(),
             antiban_budget: 10_000,
+            admin_token: String::new(),
         };
         let shared = Shared::new(&cfg);
         assert_eq!(shared.call_timeout, Duration::from_millis(10));

@@ -60,6 +60,7 @@ fn start(tag: &str, tune: impl FnOnce(&mut ServerConfig)) -> Instance {
         save_interval: Duration::from_secs(3600),
         mode: "priority".into(),
         antiban_budget: 10_000, // large par défaut : les tests anti-ban le ressèrent
+        admin_token: String::new(), // auth désactivée dans les tests E2E
     };
     tune(&mut cfg);
     let bound = server::bind_server(&cfg).expect("bind serveur E2E");
@@ -588,6 +589,7 @@ fn e2e_persistance_etat_sur_reboot() {
         save_interval: Duration::from_secs(3600),
         mode: "priority".into(),
         antiban_budget: 10_000,
+        admin_token: String::new(),
     };
     let bound = server::bind_server(&cfg).expect("bind");
     let port = bound.port;
