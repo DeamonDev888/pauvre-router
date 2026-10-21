@@ -244,23 +244,51 @@ fn completion_body(text: &str, model: &str) -> serde_json::Value {
 /// → fallback provider. Rôle → contenu → fin → [DONE].
 /// Le texte est découpé en chunks ~240 chars (frontières lignes/space) :
 /// le client rend progressivement au lieu d'attendre la réponse entière.
+/// Chunk SSE data: standard (rôle initial, delta de contenu, stop).
+fn sse_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    delta: serde_json::Value,
+    finish: Option<&str>,
+) -> String {
+    let c = serde_json::json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    });
+    format!("data: {c}\n\n")
+}
+
+/// Événement SSE de « progression » : un delta de contenu VIDE porteur
+/// de finish_reason:null — un VRAI event data: que les watchdogs
+/// OpenAI SDK comptent (contrairement aux commentaires `: ping`).
+fn sse_progress(id: &str, created: u64, model: &str) -> String {
+    sse_chunk(id, created, model, serde_json::json!({}), None)
+}
+
 fn sse_body(text: &str, model: &str) -> String {
     let id = format!("chatcmpl-pauvre-{}-{}", std::process::id(), now_epoch());
     let created = now_epoch();
+    sse_body_with(&id, created, model, text, true)
+}
+
+/// Variante avec id/created imposés et rôle optionnel — la livraison sur
+/// un flux déjà ouvert (keepalives) réutilise l'id du préambule et NE
+/// réémet PAS le rôle (déjà parti au tout début).
+fn sse_body_with(id: &str, created: u64, model: &str, text: &str, with_role: bool) -> String {
     let chunk = |delta: serde_json::Value, finish: Option<&str>| -> String {
-        let c = serde_json::json!({
-            "id": id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-        });
-        format!("data: {c}\n\n")
+        sse_chunk(id, created, model, delta, finish)
     };
-    let mut out = chunk(
-        serde_json::json!({"role": "assistant", "content": ""}),
-        None,
-    );
+    let mut out = String::new();
+    if with_role {
+        out.push_str(&chunk(
+            serde_json::json!({"role": "assistant", "content": ""}),
+            None,
+        ));
+    }
     for piece in split_stream_pieces(text) {
         out.push_str(&chunk(serde_json::json!({"content": piece}), None));
     }
@@ -990,14 +1018,23 @@ fn handle_chat(
     // 5) cascade (robin = toute la chaîne frontière)
     let chain = cascade(&model_req);
     let mut last_err: Option<(serde_json::Value, u16)> = None;
-    // SSE : préambule ouvert IMMÉDIATEMENT (ping 0) — le flux est ensuite
-    // alimenté en keepalives pendant le travail backend, quel que soit le
-    // modèle de la cascade qui tourne ; erreurs et réponse partent en
-    // payloads data: dans CE flux (jamais de HTTP brut après les headers).
+    // SSE : préambule ouvert IMMÉDIATEMENT avec le RÔLE (data: rôle) —
+    // c'est un VRAI chunk que les watchdogs OpenAI SDK comptent (les
+    // commentaires `: ping` ne les apaisent pas). Le stream_id/created
+    // sont figés ici pour que keepalives et réponse partagent le même id.
     let mut sse = wants_stream;
+    let stream_id = format!("chatcmpl-pauvre-{}-{}", std::process::id(), now_epoch());
+    let stream_created = now_epoch();
     if sse {
+        let role = sse_chunk(
+            &stream_id,
+            stream_created,
+            &model_req,
+            serde_json::json!({"role": "assistant", "content": ""}),
+            None,
+        );
         let _ = conn.stream_open(200, "OK", "text/event-stream", |s| {
-            s.write_all(b": keepalive 0\n\n")
+            s.write_all(role.as_bytes())
         });
     }
     for _attempt in 0..chain.len() {
@@ -1105,19 +1142,19 @@ fn handle_chat(
         }
         // SSE : le flux est déjà ouvert (préambule avant la cascade) —
         // alimenté en keepalives pendant le travail backend ci-dessous.
-        // keepalive : tant que le backend n'a pas répondu, un ping SSE part
-        // toutes les 5 s. Client parti (erreur d'écriture) : on arrête de
-        // pinger mais on ATTEND la fin du travail — le résultat partira au
-        // cache pour une future requête identique.
-        let mut ka_n = 0usize;
+        // keepalive : tant que le backend n'a pas répondu, un VRAI event
+        // data: (delta vide, finish null) part toutes les 5 s — les
+        // watchdogs OpenAI SDK comptent les data:, pas les commentaires.
+        // Client parti (erreur d'écriture) : on arrête de pinger mais on
+        // ATTEND la fin du travail — le résultat va au cache (requête
+        // identique suivante servie instantanément).
         let backend_result = if wants_stream {
             loop {
                 match rx.recv_timeout(Duration::from_secs(5)) {
                     Ok(r) => break Some(r),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        ka_n += 1;
                         if sse {
-                            let p = format!(": keepalive {ka_n}\n\n");
+                            let p = sse_progress(&stream_id, stream_created, &model_req);
                             if conn.stream_append(|s| s.write_all(p.as_bytes())).is_err() {
                                 sse = false; // client parti : silence, on finit le travail
                             }
@@ -1160,9 +1197,11 @@ fn handle_chat(
                     .unwrap()
                     .put(&model_req, &prompt, &ok.text);
                 if wants_stream {
-                    // la réponse SSE est DÉJÀ entamée (keepalives) : le corps
-                    // part via stream_append, la clôture via stream_close
-                    let body = sse_body(&ok.text, &model_req);
+                    // la réponse SSE est DÉJÀ entamée (rôle + keepalives) :
+                    // le corps part via stream_append (SANS réémettre le
+                    // rôle), la clôture via stream_close
+                    let body =
+                        sse_body_with(&stream_id, stream_created, &model_req, &ok.text, false);
                     if conn.stream_append(|s| s.write_all(body.as_bytes())).is_ok() {
                         let _ = conn.stream_close();
                     }

@@ -3,6 +3,21 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.8.5] — 2026-10-21
+
+### Corrigé
+- **Les watchdogs clients comptent les `data:`, pas les commentaires** :
+  le keepalive `: keepalive N` (commentaire SSE) n'apaise PAS les
+  watchdogs OpenAI SDK (« 60 s waiting for the first stream chunk ») —
+  ils attendent un VRAI événement `data:`. Le flux envoie maintenant :
+  1. le **rôle initial** (`data:` delta rôle) dès l'ouverture (<100 ms) ;
+  2. un **delta vide porteur** (`data:` finish:null) toutes les 5 s
+     pendant tout le travail backend (audit réel = 2-10 min) ;
+  3. le corps de la réponse (chunks ~240 chars) puis [DONE] à la
+     livraison — SANS réémettre le rôle, avec le même stream id.
+  Un audit long tient donc dans UN stream vivant du point de vue du
+  client, au lieu d'un flux muet que le watchdog tue à 60 s.
+
 ## [0.8.4] — 2026-10-21
 
 ### Corrigé
