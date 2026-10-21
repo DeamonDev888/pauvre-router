@@ -222,7 +222,8 @@ fn call_at_inner(
                 let err = rx_err
                     .recv_timeout(Duration::from_secs(5))
                     .unwrap_or_default();
-                let elapsed = timeout.saturating_sub(deadline - Instant::now());
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let elapsed = timeout.saturating_sub(remaining);
                 if status.success() {
                     let text = strip_banner(&out);
                     if text.is_empty() && !err.is_empty() {

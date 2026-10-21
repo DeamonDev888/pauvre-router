@@ -38,7 +38,7 @@ impl RateLimiter {
             tokens: self.capacity,
             last: now,
         });
-        let elapsed = now.duration_since(b.last).as_secs_f64();
+        let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
         b.last = now;
         b.tokens = (b.tokens + elapsed * rate_per_sec).min(self.capacity);
         if b.tokens >= 1.0 {
@@ -89,7 +89,10 @@ impl Gate {
             if now >= deadline {
                 return None;
             }
-            let (c, _t) = self.cv.wait_timeout(cur, deadline - now).unwrap();
+            let (c, _t) = self
+                .cv
+                .wait_timeout(cur, deadline.saturating_duration_since(now))
+                .unwrap();
             cur = c;
         }
         *cur += 1;
