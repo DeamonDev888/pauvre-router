@@ -225,21 +225,32 @@ fn call_at_inner(
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 let elapsed = timeout.saturating_sub(remaining);
                 if status.success() {
-                    let text = strip_banner(&out);
+                    // MODE AGENT : la réponse de l'agent et la transcription
+                    // de ses outils sortent sur STDERR (28 Ko vus en prod),
+                    // stdout n'a que la bannière ANSI. On traite les deux
+                    // comme UNE transcription — sinon on jette la réponse
+                    // réelle et on rate le texte au client.
+                    let out_clean = strip_ansi(&out);
+                    let mut combined = out_clean.trim().to_string();
+                    if !err.is_empty() {
+                        if !combined.is_empty() {
+                            combined.push_str("\n\n");
+                        }
+                        combined.push_str(strip_ansi(&err).trim());
+                    }
+                    let text = strip_banner(&combined);
                     if text.is_empty() {
                         // succès SANS texte : diagnostic (bannière seule ?
                         // stdout vide ?) — vu en prod le 21 oct, réponse
                         // vide instantanée servie au client
                         eprintln!(
-                            "[pauvre-router] backend success VIDE: out={}b err={}b out_raw={:?} err_raw={:?}",
+                            "[pauvre-router] backend success VIDE: out={}b err={}b",
                             out.len(),
-                            err.len(),
-                            out.chars().take(120).collect::<String>(),
-                            err.chars().take(120).collect::<String>()
+                            err.len()
                         );
-                    }
-                    if text.is_empty() && !err.is_empty() {
-                        return Err(BackendError::Failed { raw: err, elapsed });
+                        if !err.is_empty() {
+                            return Err(BackendError::Failed { raw: err, elapsed });
+                        }
                     }
                     return Ok(BackendOk { text, elapsed });
                 }
@@ -265,6 +276,27 @@ fn call_at_inner(
             }
         }
     }
+}
+
+/// Retire les séquences d'échappement ANSI (couleurs opencode : \x1b[0m
+/// etc.) — sinon strip_banner rate la bannière et le texte part avec ses
+/// codes de contrôle au client.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // \x1b[ ... lettre finale
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Retire la bannière `> build · model` (première ligne) + trim.

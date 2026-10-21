@@ -3,6 +3,20 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.8.3] — 2026-10-21
+
+### Corrigé
+- **Auto-empoisonnement classifieur** : en mode agent, opencode sort la
+  RÉPONSE ET la transcription des outils sur STDERR (28 Ko vus) — et un
+  audit du routeur qui lit `src/classify.rs`/`CHANGELOG.md` contient
+  fatalement les chaînes « abusive traffic » que le classifieur cherche !
+  L'audit DU ban recréait l'état de ban (circuit ouvert, cascade brûlée).
+  Fixes : (1) stdout+stderr traités comme UNE transcription en mode agent
+  (la réponse réelle est souvent sur stderr), (2) strip ANSI avant
+  strip_banner (bannières à codes couleurs non reconnues), (3) seulement
+  ~400 premiers chars de la transcription passés au classifieur (les
+  erreurs amont sont toujours EN TÊTE, jamais après 28 Ko d'outils).
+
 ## [0.8.2] — 2026-10-21
 
 ### Corrigé

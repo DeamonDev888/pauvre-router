@@ -1144,7 +1144,16 @@ fn handle_chat(
                     backend::BackendError::Failed { raw, .. } => raw.clone(),
                     backend::BackendError::Timeout { .. } => "timeout".to_string(),
                 };
-                let kind = classify::classify(&raw);
+                let kind = {
+                    // classifier SEULEMENT la tête de la sortie : les vraies
+                    // erreurs amont (quota, flag IP) sortent en tête ; le
+                    // reste est la transcription des outils de l'agent, qui
+                    // peut CONTENIR les chaînes sensibles (audit de
+                    // classify.rs → « abusive traffic » littéral →
+                    // auto-empoisonnement du circuit)
+                    let head: String = raw.chars().take(400).collect();
+                    classify::classify(&head)
+                };
                 if kind == ErrorKind::IpFlagged {
                     // circuit ouvert + cooldown amont prolongé : la gateway
                     // a flaggé l'IP — marteler ne fait qu'aggraver le flag
