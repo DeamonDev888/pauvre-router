@@ -911,7 +911,7 @@ fn handle_chat(
             _ => workdir,
         }
     };
-    let prompt = match compose_prompt(&messages, has_tools) {
+    let prompt = match compose_prompt(&messages, has_tools, workdir.as_deref()) {
         Ok(p) => p,
         Err(e) => {
             let b = err_body(&e, "invalid_request_error", None);

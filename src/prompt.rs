@@ -71,7 +71,11 @@ fn bound_system(sys: &str) -> String {
 /// les consignes les plus proches de la fin du prompt), et les DERNIERS
 /// échanges user/assistant conservés comme contexte (sans quoi une
 /// conversation Hermes perd le fil après le premier tour).
-pub fn compose_prompt(messages: &serde_json::Value, has_tools: bool) -> Result<String, String> {
+pub fn compose_prompt(
+    messages: &serde_json::Value,
+    has_tools: bool,
+    workdir: Option<&str>,
+) -> Result<String, String> {
     let arr = messages
         .as_array()
         .ok_or_else(|| "messages: tableau attendu".to_string())?;
@@ -130,11 +134,27 @@ pub fn compose_prompt(messages: &serde_json::Value, has_tools: bool) -> Result<S
     };
     let rules = proxy_rules(has_tools);
     let sys = bound_system(&sys);
-    if sys.is_empty() {
-        Ok(format!("{rules}\n\n{q}"))
+    // En mode agent avec workdir : annonce le RÉPERTOIRE EFFECTIF — sinon
+    // le « Working directory » du system prompt client (mcp-command-center…)
+    // pousse l'agent à cd hors de SON cwd réel (rejets sandbox garantis).
+    let workdir_line = if has_tools {
+        match workdir {
+            Some(d) => format!(
+                "\n- RÉPERTOIRE EFFECTIF : {d} — c'est LÀ que tu es (cd déjà \
+effectif). Tout `cd` ailleurs est rejeté par la sandbox : travaille \
+avec des chemins relatifs depuis ce répertoire."
+            ),
+            None => String::new(),
+        }
     } else {
-        Ok(format!("[Consigne système]\n{sys}\n\n{rules}\n\n{q}"))
-    }
+        String::new()
+    };
+    let prompt_body = if sys.is_empty() {
+        format!("{rules}{workdir_line}\n\n{q}")
+    } else {
+        format!("[Consigne système]\n{sys}\n\n{rules}{workdir_line}\n\n{q}")
+    };
+    Ok(prompt_body)
 }
 
 /// Texte du DERNIER message user (la « question »), sans les system ni
@@ -241,7 +261,7 @@ mod tests {
     #[test]
     fn compose_simple_user() {
         let msgs = json!([{"role": "user", "content": "salut"}]);
-        let p = compose_prompt(&msgs, false).unwrap();
+        let p = compose_prompt(&msgs, false, None).unwrap();
         // la question est en clair et le prompt se termine par elle
         assert!(p.contains("[Question]\nsalut"), "p={p}");
         assert!(p.ends_with("salut"));
@@ -256,7 +276,7 @@ mod tests {
             {"role": "system", "content": "tu es concis"},
             {"role": "user", "content": "ping"}
         ]);
-        let p = compose_prompt(&msgs, false).unwrap();
+        let p = compose_prompt(&msgs, false, None).unwrap();
         assert!(p.starts_with("[Consigne système]\ntu es concis"), "p={p}");
         assert!(
             p.contains("Règles du proxy"),
@@ -276,7 +296,7 @@ mod tests {
         let msgs = json!([
             {"role": "user", "content": [{"type": "text", "text": "ligne1"}, {"type": "text", "text": "ligne2"}]}
         ]);
-        let p = compose_prompt(&msgs, false).unwrap();
+        let p = compose_prompt(&msgs, false, None).unwrap();
         assert!(p.ends_with("[Question]\nligne1\nligne2"), "p={p}");
     }
 
@@ -287,7 +307,7 @@ mod tests {
             {"role": "assistant", "content": "Enchanté Marc !"},
             {"role": "user", "content": "tu te souviens de mon prénom ?"}
         ]);
-        let p = compose_prompt(&msgs, false).unwrap();
+        let p = compose_prompt(&msgs, false, None).unwrap();
         // la question est le DERNIER user, pas le premier
         assert!(
             p.ends_with("[Question]\ntu te souviens de mon prénom ?"),
@@ -309,7 +329,7 @@ mod tests {
             msgs.push(json!({"role": "assistant", "content": format!("a{i}")}));
         }
         msgs.push(json!({"role": "user", "content": "final"}));
-        let p = compose_prompt(&json!(msgs), false).unwrap();
+        let p = compose_prompt(&json!(msgs), false, None).unwrap();
         // seuls les 6 derniers échanges sont gardés : u0/u1 doivent avoir disparu
         assert!(!p.contains("u0 "), "historique non borné: {p}");
         assert!(p.contains("u9"), "les récents sont là");
@@ -319,8 +339,8 @@ mod tests {
     #[test]
     fn compose_empty_refused() {
         let msgs = json!([{"role": "assistant", "content": "moi seul"}]);
-        assert!(compose_prompt(&msgs, false).is_err());
-        assert!(compose_prompt(&json!("pas un tableau"), false).is_err());
+        assert!(compose_prompt(&msgs, false, None).is_err());
+        assert!(compose_prompt(&json!("pas un tableau"), false, None).is_err());
     }
 
     #[test]
@@ -342,7 +362,7 @@ mod tests {
             {"role": "system", "content": huge},
             {"role": "user", "content": "ping"}
         ]);
-        let p = compose_prompt(&msgs, true).unwrap();
+        let p = compose_prompt(&msgs, true, None).unwrap();
         assert!(
             p.chars().count() < 12_000,
             "prompt borné attendu, {} chars",
@@ -354,7 +374,7 @@ mod tests {
             {"role": "system", "content": "tu es un assistant concis"},
             {"role": "user", "content": "ping"}
         ]);
-        let p2 = compose_prompt(&msgs2, false).unwrap();
+        let p2 = compose_prompt(&msgs2, false, None).unwrap();
         assert!(p2.contains("tu es un assistant concis"));
         assert!(!p2.contains("tronquée"));
     }
@@ -365,7 +385,7 @@ mod tests {
             {"role": "system", "content": "Tu es Hermes. Utilise skill_view, memory, cron."},
             {"role": "user", "content": "audit complet"}
         ]);
-        let p = compose_prompt(&msgs, true).unwrap();
+        let p = compose_prompt(&msgs, true, None).unwrap();
         assert!(p.contains("FRONTIÈRE D'ENVIRONNEMENT"), "p={p}");
         assert!(p.contains("n'invoque JAMAIS"), "p={p}");
         // l'ordre tient : système → règles (avec frontière) → question
@@ -373,5 +393,23 @@ mod tests {
         let i_f = p.find("FRONTIÈRE").unwrap();
         let i_q = p.find("[Question]").unwrap();
         assert!(i_sys < i_f && i_f < i_q, "p={p}");
+    }
+
+    #[test]
+    fn workdir_effectif_annonce_en_mode_agent() {
+        let msgs = json!([
+            {"role": "system", "content": "Working directory: C:\\Users\\Deamon\\Desktop\\mcp-command-center"},
+            {"role": "user", "content": "audit complet"}
+        ]);
+        let p = compose_prompt(&msgs, true, Some("C:\\repo\\pauvre-router")).unwrap();
+        assert!(p.contains("RÉPERTOIRE EFFECTIF"), "p={p}");
+        assert!(p.contains("C:\\repo\\pauvre-router"), "p={p}");
+        // pas d'annonce en mode texte ni sans workdir
+        assert!(!compose_prompt(&msgs, false, Some("C:\\x"))
+            .unwrap()
+            .contains("RÉPERTOIRE EFFECTIF"));
+        assert!(!compose_prompt(&msgs, true, None)
+            .unwrap()
+            .contains("RÉPERTOIRE EFFECTIF"));
     }
 }
