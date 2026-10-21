@@ -949,6 +949,16 @@ fn handle_chat(
     // 5) cascade (robin = toute la chaîne frontière)
     let chain = cascade(&model_req);
     let mut last_err: Option<(serde_json::Value, u16)> = None;
+    // SSE : préambule ouvert IMMÉDIATEMENT (ping 0) — le flux est ensuite
+    // alimenté en keepalives pendant le travail backend, quel que soit le
+    // modèle de la cascade qui tourne ; erreurs et réponse partent en
+    // payloads data: dans CE flux (jamais de HTTP brut après les headers).
+    let mut sse = wants_stream;
+    if sse {
+        let _ = conn.write_stream(200, "OK", "text/event-stream", |s| {
+            s.write_all(b": keepalive 0\n\n")
+        });
+    }
     for _attempt in 0..chain.len() {
         let now = Instant::now();
         // (modèle, timeout effectif) : le robin intelligent renvoie un
@@ -984,19 +994,32 @@ fn handle_chat(
             match picked {
                 Some(p) => p,
                 None => {
-                    let b = err_body(
-                        "tous les modeles frontieres sont en cooldown, reessaie plus tard",
-                        "rate_limit_error",
-                        Some(30),
-                    );
-                    let _ = conn.write_response(
-                        429,
-                        "Too Many Requests",
-                        "application/json",
-                        b.to_string().as_bytes(),
-                        &[],
-                        keep,
-                    );
+                    if sse {
+                        // flux SSE déjà ouvert : l'erreur part en payload
+                        // data: (jamais de HTTP brut dans un flux ouvert)
+                        let e = serde_json::json!({"error": {
+                            "message": "tous les modeles frontieres sont en cooldown, reessaie plus tard",
+                            "type": "rate_limit_error",
+                            "retry_after": 30,
+                        }});
+                        let body = format!("data: {e}\n\ndata: [DONE]\n\n");
+                        let _ = conn.stream_append(|s| s.write_all(body.as_bytes()));
+                        let _ = conn.stream_close();
+                    } else {
+                        let b = err_body(
+                            "tous les modeles frontieres sont en cooldown, reessaie plus tard",
+                            "rate_limit_error",
+                            Some(30),
+                        );
+                        let _ = conn.write_response(
+                            429,
+                            "Too Many Requests",
+                            "application/json",
+                            b.to_string().as_bytes(),
+                            &[],
+                            keep,
+                        );
+                    }
                     shared.in_flight.fetch_sub(1, Ordering::Relaxed);
                     return;
                 }
@@ -1010,16 +1033,69 @@ fn handle_chat(
         };
         let is_fallback = model != model_req && model_req != ROBIN_MODEL;
 
-        match backend::call_at(
-            &shared_backend_exe(shared),
-            &model,
-            &prompt,
-            effective_timeout,
-            api_key,
-            &shared.backend_env,
-            has_tools,
-            workdir.as_deref(),
-        ) {
+        // Appel backend sur un THREAD DÉDIÉ + keepalive SSE : pendant que
+        // l'agent opencode travaille (30 s-15 min), un ping SSE part toutes
+        // les 5 s — le watchdog « premier chunk » du client ne tire jamais,
+        // et le socket reste chaud. En non-stream, pas de keepalive possible
+        // (la réponse doit partir d'un bloc) : timeout plein.
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let exe = shared_backend_exe(shared);
+            let model_t = model.clone();
+            let prompt_t = prompt.clone();
+            let timeout_t = effective_timeout;
+            let key_t = api_key.map(|s| s.to_string());
+            let env_t = shared.backend_env.clone();
+            let agent_t = has_tools;
+            let dir_t = workdir.clone();
+            std::thread::spawn(move || {
+                let r = backend::call_at(
+                    &exe,
+                    &model_t,
+                    &prompt_t,
+                    timeout_t,
+                    key_t.as_deref(),
+                    &env_t,
+                    agent_t,
+                    dir_t.as_deref(),
+                );
+                let _ = tx.send(r);
+            });
+        }
+        // SSE : le flux est déjà ouvert (préambule avant la cascade) —
+        // alimenté en keepalives pendant le travail backend ci-dessous.
+        // keepalive : tant que le backend n'a pas répondu, un ping SSE part
+        // toutes les 5 s. Client parti (erreur d'écriture) : on arrête de
+        // pinger mais on ATTEND la fin du travail — le résultat partira au
+        // cache pour une future requête identique.
+        let mut ka_n = 0usize;
+        let backend_result = if wants_stream {
+            loop {
+                match rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(r) => break Some(r),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        ka_n += 1;
+                        if sse {
+                            let p = format!(": keepalive {ka_n}\n\n");
+                            if conn.stream_append(|s| s.write_all(p.as_bytes())).is_err() {
+                                sse = false; // client parti : silence, on finit le travail
+                            }
+                        }
+                    }
+                    Err(_) => break None,
+                }
+            }
+        } else {
+            rx.recv().ok()
+        };
+        let backend_result = backend_result.unwrap_or_else(|| {
+            // secours (canal fermé / thread paniqué) : erreur classée
+            Err(backend::BackendError::Failed {
+                raw: "backend thread paniqué".into(),
+                elapsed: Duration::ZERO,
+            })
+        });
+        match backend_result {
             Ok(ok) => {
                 let lat = ok.elapsed;
                 {
@@ -1042,7 +1118,24 @@ fn handle_chat(
                     .lock()
                     .unwrap()
                     .put(&model_req, &prompt, &ok.text);
-                respond_chat(conn, &ok.text, &model_req, wants_stream, keep);
+                if wants_stream {
+                    // la réponse SSE est DÉJÀ entamée (keepalives) : le corps
+                    // part via stream_append, la clôture via stream_close
+                    let body = sse_body(&ok.text, &model_req);
+                    if conn.stream_append(|s| s.write_all(body.as_bytes())).is_ok() {
+                        let _ = conn.stream_close();
+                    }
+                } else {
+                    let b = completion_body(&ok.text, &model_req);
+                    let _ = conn.write_response(
+                        200,
+                        "OK",
+                        "application/json",
+                        b.to_string().as_bytes(),
+                        &[],
+                        keep,
+                    );
+                }
                 shared.in_flight.fetch_sub(1, Ordering::Relaxed);
                 return;
             }
@@ -1115,8 +1208,6 @@ fn handle_chat(
         keep,
     );
 }
-
-/// Exe backend — figé au boot dans `Shared::backend_exe_cell`.
 fn shared_backend_exe(shared: &Shared) -> String {
     shared
         .backend_exe_cell

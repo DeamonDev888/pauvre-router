@@ -3,6 +3,25 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.8.1] — 2026-10-21
+
+### Ajouté
+- **Keepalive SSE pendant le travail backend** : l'appel opencode part sur
+  un thread dédié et le flux SSE est ouvert IMMÉDIATEMENT (ping 0), puis
+  un commentaire `: keepalive N` part toutes les 5 s jusqu'à la fin du
+  travail (limité par le timeout backend, pas par le client). Fini le
+  « 60 s waiting for the first stream chunk » des watchdogs clients :
+  les headers et le premier octet partent en < 100 ms, le client reçoit
+  du trafic en continu pendant qu'un audit réel (2-10 min) s'exécute.
+  Client parti en cours de route : le ping s'arrête mais le travail se
+  TERMINE et va au cache (requête identique suivante servie instantanément).
+- Erreurs en flux ouvert : les 429 « tous en cooldown » partent en payload
+  `data:` + [DONE] (jamais de HTTP brut après des headers SSE).
+
+### Corrigé
+- Elapsed backend calculé via `saturating_duration_since` (anti-panic,
+  trouvé par l'audit de l'agent backend lui-même).
+
 ## [0.8.0] — 2026-10-21
 
 ### Corrigé

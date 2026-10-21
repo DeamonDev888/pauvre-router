@@ -359,6 +359,29 @@ impl HttpConn {
         }
         result
     }
+
+    /// Émet des octets supplémentaires sur une réponse chunked DÉJÀ
+    /// entamée avec [`write_stream`] — SANS re-émettre les headers
+    /// (gardalive SSE, clôture différée d'un flux).
+    pub fn stream_append<F>(&self, emit: F) -> std::io::Result<()>
+    where
+        F: FnOnce(&mut dyn Write) -> std::io::Result<()>,
+    {
+        let mut w = self.try_write_half()?;
+        let mut sink = ChunkSink { w: &mut w, err: None };
+        let r = emit(&mut sink);
+        if let Some(e) = sink.err.take() {
+            return Err(e);
+        }
+        r
+    }
+
+    /// Termine une réponse chunked entamée (chunk terminal 0\r\n\r\n).
+    pub fn stream_close(&self) -> std::io::Result<()> {
+        let mut w = self.try_write_half()?;
+        w.write_all(b"0\r\n\r\n")?;
+        w.flush()
+    }
 }
 
 /// Émet les chunks du callback vers la socket (fonction libre : évite
