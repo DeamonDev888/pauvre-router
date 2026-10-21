@@ -33,7 +33,18 @@ use std::time::{Duration, Instant};
 
 const MAX_BODY: usize = 8_000_000; // 8 Mo — sessions Hermes lourdes (848 messages ≈ 1.2-1.5 Mo de JSON)
 const KEY_BACKOFF: u64 = 1800; // cooldown clé après échec (30 min)
-const N_WORKERS: usize = 8; // workers fixes — LA réponse anti-zombie
+/// Workers fixes — LA réponse anti-zombie (aucun thread par connexion).
+///
+/// NB : un worker sert sa connexion JUSQU'À SA MORT (keep-alive : il
+/// attend la requête suivante jusqu'à `http::MAX_IDLE`, et une requête
+/// chat longue le retient jusqu'à 4 min). 8 workers suffisaient pour un
+/// usage occasionnel, mais 8 connexions keep-alive INACTIVES (le cas
+/// normal d'un SDK OpenAI qui garde son pool de sockets) =
+/// 8 workers immobilisés = service MUET (plus un seul /health servi).
+/// D'où 24 workers : la pression amont reste bornée par AILLEURS
+/// (token-bucket par IP, budget anti-ban, gate backend à 3) — plus de
+/// workers = plus de CONNEXIONS servies, jamais plus d'appels amont.
+const N_WORKERS: usize = 24;
 const QUEUE_CAP: usize = 64; // file de connexions en attente
 
 /// Token d'administration par défaut (endpoint `/admin/*`). Surchargeable
@@ -342,6 +353,22 @@ fn sse_body(text: &str, model: &str) -> String {
     let id = format!("chatcmpl-pauvre-{}-{}", std::process::id(), now_epoch());
     let created = now_epoch();
     sse_body_with(&id, created, model, text, true)
+}
+
+/// Erreur TERMINALE d'un flux SSE DÉJÀ ouvert : payload `data:` portant
+/// l'objet erreur (forme OpenAI), puis `[DONE]`, puis clôture du chunked.
+///
+/// Pourquoi : une fois le flux entamé (status line + préambule rôle
+/// envoyés), la réponse HTTP est déjà partie — écrire une 2e réponse
+/// HTTP brute (le chemin non-stream) CORROMPT le chunked en cours : le
+/// client OpenAI voit une seconde status line et casse en « Connection
+/// error » au lieu de lire une erreur exploitable. La forme
+/// `data: {"error":{...}}` est celle que les SDK OpenAI savent lire
+/// (événement d'erreur du flux).
+fn sse_error_close(conn: &HttpConn, body: &serde_json::Value) {
+    let payload = format!("data: {body}\n\ndata: [DONE]\n\n");
+    let _ = conn.stream_append(|s| s.write_all(payload.as_bytes()));
+    let _ = conn.stream_close();
 }
 
 /// Variante avec id/created imposés et rôle optionnel — la livraison sur
@@ -1124,6 +1151,11 @@ fn handle_chat(
     // commentaires `: ping` ne les apaisent pas). Le stream_id/created
     // sont figés ici pour que keepalives et réponse partagent le même id.
     let mut sse = wants_stream;
+    // Le flux SSE est-il DÉJÀ ouvert (status line + rôle envoyés) ? Tant
+    // qu'il l'est, TOUTE réponse doit être encodée en SSE (data:) — une
+    // réponse HTTP brute écrite dans un chunked ouvert CORROMPT le flux
+    // (2e status line → « Connection error » côté client OpenAI).
+    let mut sse_open = false;
     let stream_id = format!("chatcmpl-pauvre-{}-{}", std::process::id(), now_epoch());
     let stream_created = now_epoch();
     if sse {
@@ -1137,6 +1169,8 @@ fn handle_chat(
         let _ = conn.stream_open(200, "OK", "text/event-stream", |s| {
             s.write_all(role.as_bytes())
         });
+        // le flux est entamé : dès lors, plus JAMAIS de HTTP brut
+        sse_open = true;
     }
     for _attempt in 0..chain.len() {
         let now = Instant::now();
@@ -1173,17 +1207,15 @@ fn handle_chat(
             match picked {
                 Some(p) => p,
                 None => {
-                    if sse {
-                        // flux SSE déjà ouvert : l'erreur part en payload
+                    if sse_open {
+                        // flux SSE DÉJÀ ouvert : l'erreur part en payload
                         // data: (jamais de HTTP brut dans un flux ouvert)
                         let e = serde_json::json!({"error": {
                             "message": "tous les modeles frontieres sont en cooldown, reessaie plus tard",
                             "type": "rate_limit_error",
                             "retry_after": 30,
                         }});
-                        let body = format!("data: {e}\n\ndata: [DONE]\n\n");
-                        let _ = conn.stream_append(|s| s.write_all(body.as_bytes()));
-                        let _ = conn.stream_close();
+                        sse_error_close(conn, &e);
                     } else {
                         let b = err_body(
                             "tous les modeles frontieres sont en cooldown, reessaie plus tard",
@@ -1392,14 +1424,23 @@ fn handle_chat(
             502,
         )
     });
-    let _ = conn.write_response(
-        code,
-        "Bad Gateway",
-        "application/json",
-        b.to_string().as_bytes(),
-        &[],
-        keep,
-    );
+    if sse_open {
+        // Le flux SSE est DÉJÀ ouvert (préambule rôle + keepalives) :
+        // l'erreur part en payload data: puis [DONE] + clôture. Écrire
+        // ici une réponse HTTP brute (le chemin non-stream) CORROMPrait
+        // le chunked en cours — le client OpenAI aurait vu une 2e
+        // status line et cassé en « Connection error ».
+        sse_error_close(conn, &b);
+    } else {
+        let _ = conn.write_response(
+            code,
+            "Bad Gateway",
+            "application/json",
+            b.to_string().as_bytes(),
+            &[],
+            keep,
+        );
+    }
 }
 fn shared_backend_exe(shared: &Shared) -> String {
     shared

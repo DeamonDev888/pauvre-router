@@ -3,6 +3,34 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.8.7] — 2026-10-21
+
+(publiée avec les changements 0.8.6 ci-dessous, trouvés par l'auto-audit
+continu de l'agent backend)
+
+## [0.8.6] — 2026-10-21
+
+### Corrigé
+- **Le flux SSE ne peut plus recevoir une 2e réponse HTTP** : à l'ouverture
+  du flux (`data:` rôle), la réponse HTTP est DÉJÀ partie ; en cas
+  d'échec de la cascade entière, le serveur y écrivait une réponse HTTP
+  brute (`502 Bad Gateway`) — le chunked en cours était CORROMPU (2e
+  status line dans le flux) et le client OpenAI cassait en « Connection
+  error » au lieu de lire l'erreur. L'erreur part désormais en payload
+  `data: {"error":{…}}` puis `[DONE]` + clôture propre du flux (même
+  forme que le chemin « tous les modèles en cooldown »).
+
+### Robustesse
+- **Le service ne peut plus devenir muet sous keep-alive** : un worker
+  sert sa connexion jusqu'à sa mort (il attend la requête suivante
+  pendant `MAX_IDLE`), et une requête chat longue le retient jusqu'à
+  4 min. Avec 8 workers, 8 connexions keep-alive INACTIVES (le cas
+  normal d'un SDK OpenAI qui garde son pool de sockets) suffisaient à
+  immobiliser tout le pool : plus un seul `/health` ni chat servi. Le
+  pool passe à **24 workers** — la pression amont reste bornée par
+  ailleurs (token-bucket par IP, budget anti-ban, gate backend à 3) :
+  plus de connexions servies, jamais plus d'appels amont.
+
 ## [0.8.5] — 2026-10-21
 
 ### Corrigé

@@ -962,6 +962,85 @@ fn e2e_antiban_flag_ouvre_le_circuit_et_le_re_close_sur_succes() {
 }
 
 #[test]
+fn e2e_sse_erreur_cascade_reste_un_flux_sse_valide() {
+    // Tous les modèles échouent → la cascade se termine en erreur. MAIS le
+    // flux SSE a DÉJÀ été ouvert (préambule rôle) : le serveur NE DOIT PAS
+    // y écrire une 2e réponse HTTP brute — cela corrompt le chunked en
+    // cours et le client OpenAI casse en « Connection error » au lieu de
+    // lire une erreur exploitable. L'erreur doit partir en payload data:
+    // puis le flux se clôt par [DONE].
+    let i = start("sse-erreur", |c| {
+        c.backend_env = vec![("STUB_FAIL".into(), FREE_MODELS.join(","))];
+    });
+    let body = serde_json::json!({
+        "model": "glm-5.3-flash-free",
+        "stream": true,
+        "messages": [{"role": "user", "content": "PONG cascade cassee"}]
+    });
+    let (code, raw) = req(
+        i.port,
+        "POST",
+        "/v1/chat/completions",
+        body.to_string().as_bytes(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(code, 200, "le flux SSE est ouvert en 200: {raw}");
+    // UNE SEULE réponse HTTP dans tout le flux (pas de 2e status line)
+    assert_eq!(
+        raw.matches("HTTP/1.1").count(),
+        1,
+        "le flux ne doit contenir QU'UNE réponse HTTP: {raw}"
+    );
+    // l'erreur est transportée dans un payload SSE, pas en HTTP brut
+    assert!(
+        raw.contains("\"error\""),
+        "l'erreur doit être dans un chunk SSE: {raw}"
+    );
+    // et le flux est clôturé proprement (le client n'attend pas forever)
+    assert!(
+        raw.contains("data: [DONE]"),
+        "le flux SSE doit se clôturer par [DONE]: {raw}"
+    );
+}
+
+#[test]
+fn e2e_sante_reste_servie_avec_beaucoup_de_keepalive_inactifs() {
+    // Un client (SDK OpenAI, Hermes) garde ses connexions en keep-alive :
+    // le worker qui la sert attend la requête suivante (jusqu'à MAX_IDLE).
+    // 10 connexions INACTIVES ne doivent pas saturer le pool de workers :
+    // /health doit rester servi. Avant : 8 workers → 8 connexions inactives
+    // = service muet (le /health en attente ne sort jamais).
+    let i = start("idle-keepalive", |_| {});
+    let mut idle = Vec::new();
+    for _ in 0..10 {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", i.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf).unwrap();
+        assert!(
+            n > 0,
+            "le serveur doit répondre avant de se mettre en attente"
+        );
+        idle.push(s); // la connexion reste OUVERTE et inactive
+    }
+    // une NOUVELLE connexion doit être servie immédiatement
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", i.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    assert!(
+        out.starts_with("HTTP/1.1 200"),
+        "le service doit rester disponible malgré les keep-alive inactifs: {out}"
+    );
+    drop(idle);
+}
+
+#[test]
 fn e2e_antiban_endpoint_admin() {
     // GET /admin/antiban expose budget + compteur ; POST change le budget
     // à chaud (plancher MIN_BUDGET=6 respecté) et /admin/stats embarque

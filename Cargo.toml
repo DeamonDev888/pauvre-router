@@ -1,6 +1,6 @@
 [package]
 name = "pauvre-router"
-version = "0.8.6"
+version = "0.8.7"
 edition = "2021"
 description = "Router des Pauvres - proxy local OpenAI-compat vers les modeles gratuits OpenCode Zen, avec anti-spam, detection d'exhaustion, cascade, rotation de cles API et modes priority/roundrobin"
 license = "MIT"
