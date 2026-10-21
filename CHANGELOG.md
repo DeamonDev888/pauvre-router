@@ -3,6 +3,21 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.8.0] — 2026-10-21
+
+### Corrigé
+- **Confusion d'identité du backend agent** (audit 21 oct) : la demande
+  « audit du router des pauvre » passée à travers le proxy parlait à un
+  backend qui ne sait pas QU'IL EST le backend du Router des Pauvres —
+  piégé par le persona cybersécurité du client, il est parti auditer le
+  routeur LAN (SSH 192.168.40.1, scan passerelle) au lieu du service
+  lui-même, et a brûlé la cascade sur des lectures hors workdir
+  (`external_directory … auto-rejecting`). Règle IDENTITÉ ajoutée au mode
+  agent : « tu es le backend du service pauvre-router (127.0.0.1:4445,
+  repo dans ton workdir) ; toute mention du routeur désigne CE service,
+  jamais un routeur réseau — zéro scan LAN, zéro SSH » + consigne de
+  continuation après rejet sandbox (ne jamais abandonner la tâche).
+
 ## [0.7.9] — 2026-10-20
 
 ### Corrigé
