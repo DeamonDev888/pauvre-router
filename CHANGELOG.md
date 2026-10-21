@@ -3,6 +3,16 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.7.9] — 2026-10-20
+
+### Corrigé
+- **PATH amputé en mode agent** : `backend.rs` forçait `PATH=C:\Windows\System32`
+  sur TOUS les spawns — l'agent build exécutait ses outils bash avec ce PATH
+  nu → `ls: command not found`, `git`/`cargo` introuvables sur chaque appel
+  outil (vu en prod pendant un audit réel). En mode AGENT, le spawn reçoit
+  maintenant un PATH complet (git-bash usr/bin + mingw64 + cmd + système +
+  PATH du routeur en secours) ; le mode TEXTE garde le minimal.
+
 ## [0.7.8] — 2026-10-20
 
 ### Corrigé

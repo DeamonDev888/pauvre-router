@@ -86,6 +86,30 @@ pub fn call_at(
     )
 }
 
+/// PATH complet pour le mode agent (outils réels) : git-bash + système,
+/// puis le PATH du process routeur en secours. En mode TEXTE, le PATH
+/// minimal (System32) suffit — aucun outil n'est exécuté. Vu en prod :
+/// l'agent build exécutait `ls` avec le PATH System32 seul → « command
+/// not found » sur chaque outil → cascade brûlée.
+fn agent_path() -> String {
+    let candidates = [
+        r"C:\Program Files\Git\usr\bin",
+        r"C:\Program Files\Git\mingw64\bin",
+        r"C:\Program Files\Git\cmd",
+        r"C:\Windows\System32",
+        r"C:\Windows",
+    ];
+    let mut parts: Vec<String> = candidates
+        .iter()
+        .filter(|p| std::path::Path::new(p).is_dir())
+        .map(|p| p.to_string())
+        .collect();
+    if let Ok(parent) = std::env::var("PATH") {
+        parts.push(parent);
+    }
+    parts.join(";")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn call_at_inner(
     exe: &str,
@@ -128,7 +152,14 @@ fn call_at_inner(
     cmd.env("USERPROFILE", "C:\\Users\\Deamon")
         .env("HOMEDRIVE", "C:")
         .env("HOMEPATH", "\\Users\\Deamon")
-        .env("PATH", r"C:\Windows\System32");
+        .env(
+            "PATH",
+            if use_agent_build {
+                agent_path()
+            } else {
+                r"C:\Windows\System32".to_string()
+            },
+        );
     match api_key {
         Some(k) => cmd.env("OPENCODE_API_KEY", k),
         None => cmd.env_remove("OPENCODE_API_KEY"),
