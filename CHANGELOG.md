@@ -3,6 +3,18 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.8.2] — 2026-10-21
+
+### Corrigé
+- **Flux SSE refermé au premier ping** : `write_stream` émet le chunk
+  terminal HTTP dès son callback — le préambule du keepalive clôturait
+  donc la réponse immédiatement (client : flux « fini » à 0,03 s, corps
+  jamais reçu ; serveur : travail terminé en arrière-plan, mis au cache,
+  jamais livré). Nouveau `stream_open` (headers + contenu SANS chunk
+  terminal) + `stream_close` à la livraison ; `write_stream` inchangé
+  pour les réponses d'un bloc.
+- Diagnostic « backend success VIDE » ajouté (sortie bannière-seule).
+
 ## [0.8.1] — 2026-10-21
 
 ### Ajouté

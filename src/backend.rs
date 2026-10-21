@@ -226,6 +226,18 @@ fn call_at_inner(
                 let elapsed = timeout.saturating_sub(remaining);
                 if status.success() {
                     let text = strip_banner(&out);
+                    if text.is_empty() {
+                        // succès SANS texte : diagnostic (bannière seule ?
+                        // stdout vide ?) — vu en prod le 21 oct, réponse
+                        // vide instantanée servie au client
+                        eprintln!(
+                            "[pauvre-router] backend success VIDE: out={}b err={}b out_raw={:?} err_raw={:?}",
+                            out.len(),
+                            err.len(),
+                            out.chars().take(120).collect::<String>(),
+                            err.chars().take(120).collect::<String>()
+                        );
+                    }
                     if text.is_empty() && !err.is_empty() {
                         return Err(BackendError::Failed { raw: err, elapsed });
                     }

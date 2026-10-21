@@ -955,7 +955,7 @@ fn handle_chat(
     // payloads data: dans CE flux (jamais de HTTP brut après les headers).
     let mut sse = wants_stream;
     if sse {
-        let _ = conn.write_stream(200, "OK", "text/event-stream", |s| {
+        let _ = conn.stream_open(200, "OK", "text/event-stream", |s| {
             s.write_all(b": keepalive 0\n\n")
         });
     }

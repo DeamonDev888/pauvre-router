@@ -360,6 +360,36 @@ impl HttpConn {
         result
     }
 
+    /// Ouvre une réponse chunked (headers + premier contenu) SANS chunk
+    /// terminal — le flux reste ouvert pour [`stream_append`] et se
+    /// termine par [`stream_close`]. (`write_stream`, lui, clôt d'un coup.)
+    pub fn stream_open<F>(
+        &self,
+        status: u16,
+        reason: &str,
+        content_type: &str,
+        emit: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&mut dyn Write) -> std::io::Result<()>,
+    {
+        let mut w = self.try_write_half()?;
+        let head = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
+        w.write_all(head.as_bytes())?;
+        w.flush()?;
+        let mut sink = ChunkSink {
+            w: &mut w,
+            err: None,
+        };
+        let r = emit(&mut sink);
+        if let Some(e) = sink.err.take() {
+            return Err(e);
+        }
+        r
+    }
+
     /// Émet des octets supplémentaires sur une réponse chunked DÉJÀ
     /// entamée avec [`write_stream`] — SANS re-émettre les headers
     /// (gardalive SSE, clôture différée d'un flux).
@@ -368,7 +398,10 @@ impl HttpConn {
         F: FnOnce(&mut dyn Write) -> std::io::Result<()>,
     {
         let mut w = self.try_write_half()?;
-        let mut sink = ChunkSink { w: &mut w, err: None };
+        let mut sink = ChunkSink {
+            w: &mut w,
+            err: None,
+        };
         let r = emit(&mut sink);
         if let Some(e) = sink.err.take() {
             return Err(e);
