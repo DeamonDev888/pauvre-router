@@ -144,3 +144,51 @@ fn call_at_spawn_inexistant_erreur_failed() {
     .expect_err("spawn impossible = Failed");
     assert!(matches!(err, BackendError::Failed { .. }));
 }
+
+/// RÉGRESSION du bug « desktop » : le journal des outils (`tool_use`)
+/// ne doit JAMAIS atteindre le client — seule la réponse (`text`)
+/// doit être servie. Le stub émet un `tool_use` AVANT le `text`.
+#[test]
+fn call_at_journal_des_outils_ne_fuit_pas() {
+    let ok = call_at(
+        stub(),
+        "m",
+        "TOOLLOG PONG",
+        Duration::from_secs(10),
+        None,
+        &[],
+        false,
+        None,
+    )
+    .expect("stub doit répondre");
+    assert_eq!(ok.text, "ack opencode/m: PONG");
+    assert!(
+        !ok.text.contains("SECRETLOG"),
+        "le journal des outils a fuité: {}",
+        ok.text
+    );
+}
+
+/// L'erreur amont structurée doit atteindre le classifieur : le stub
+/// émet un événement `error` JSON (et non un stderr texte).
+#[test]
+fn call_at_erreur_structuree_atteint_le_classifieur() {
+    let err = call_at(
+        stub(),
+        "m",
+        "COOLDOWN 42",
+        Duration::from_secs(10),
+        None,
+        &[],
+        false,
+        None,
+    )
+    .expect_err("COOLDOWN doit faire échouer");
+    match err {
+        BackendError::Failed { raw, .. } => {
+            assert!(raw.contains("retry after 42"), "raw={raw}");
+            assert_eq!(classify(&raw), ErrorKind::Exhausted);
+        }
+        other => panic!("attendu Failed, eu {other:?}"),
+    }
+}

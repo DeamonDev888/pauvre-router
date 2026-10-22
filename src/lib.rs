@@ -17,6 +17,7 @@ pub mod http;
 pub mod keystore;
 pub mod logbuf;
 pub mod models;
+pub mod ocjson;
 pub mod prompt;
 pub mod server;
 pub mod stats;

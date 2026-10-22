@@ -193,7 +193,8 @@ macro_rules! slog {
     ($shared:expr, $($arg:tt)*) => {{
         let line = format!($($arg)*);
         eprintln!("{line}");
-        if let Ok(mut b) = $shared.log_buf.lock() {
+        {
+            let mut b = $shared.log_buf.lock().unwrap_or_else(|e| e.into_inner());
             b.push(&line);
         }
     }};
@@ -611,7 +612,11 @@ fn route_request(
             .header("x-tail")
             .and_then(|v| v.parse().ok())
             .unwrap_or(50);
-        let lines = shared.log_buf.lock().unwrap().tail(tail);
+        let lines = shared
+            .log_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tail(tail);
         let body = serde_json::json!({ "lines": lines, "tail": tail });
         let _ = conn.write_response(
             200,
@@ -664,10 +669,12 @@ fn route_request(
         return;
     }
     if req.method == "POST" && (path == "/admin/cache/clear" || path == "/admin/reset") {
-        if let Ok(mut c) = shared.cache.lock() {
+        {
+            let mut c = shared.cache.lock().unwrap_or_else(|e| e.into_inner());
             c.clear();
         }
-        if let Ok(mut reg) = shared.registry.lock() {
+        {
+            let mut reg = shared.registry.lock().unwrap_or_else(|e| e.into_inner());
             reg.clear();
         }
         let body = serde_json::json!({"cleared": true});
@@ -684,7 +691,11 @@ fn route_request(
 
     // ---- mode de routage ----
     if req.method == "GET" && path == "/admin/mode" {
-        let m = shared.mode.lock().unwrap().clone();
+        let m = shared
+            .mode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let body = serde_json::json!({"mode": m});
         let _ = conn.write_response(
             200,
@@ -701,7 +712,7 @@ fn route_request(
             serde_json::from_slice(&req.body).unwrap_or(serde_json::json!({}));
         let wanted = body.get("mode").and_then(|v| v.as_str()).unwrap_or("");
         if wanted == "priority" || wanted == "roundrobin" {
-            *shared.mode.lock().unwrap() = wanted.to_string();
+            *shared.mode.lock().unwrap_or_else(|e| e.into_inner()) = wanted.to_string();
             let body = serde_json::json!({"mode": wanted, "applied": true});
             let _ = conn.write_response(
                 200,
@@ -731,7 +742,11 @@ fn route_request(
 
     // ---- pool de clés API ----
     if req.method == "GET" && path == "/admin/keys" {
-        let body = shared.keystore.lock().unwrap().meta();
+        let body = shared
+            .keystore
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .meta();
         let _ = conn.write_response(
             200,
             "OK",
@@ -844,8 +859,12 @@ fn route_request(
 }
 
 fn admin_stats(conn: &mut HttpConn, shared: &Arc<Shared>, keep: bool) {
-    let stats = shared.stats.lock().unwrap().clone();
-    let reg = shared.registry.lock().unwrap();
+    let stats = shared
+        .stats
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let reg = shared.registry.lock().unwrap_or_else(|e| e.into_inner());
     let mut health = serde_json::Map::new();
     let now = Instant::now();
     for m in FREE_MODELS {
@@ -868,7 +887,7 @@ fn admin_stats(conn: &mut HttpConn, shared: &Arc<Shared>, keep: bool) {
         );
     }
     drop(reg);
-    let spam = shared.spam_log.lock().unwrap();
+    let spam = shared.spam_log.lock().unwrap_or_else(|e| e.into_inner());
     let recent_spam: Vec<_> = spam
         .iter()
         .rev()
@@ -876,8 +895,16 @@ fn admin_stats(conn: &mut HttpConn, shared: &Arc<Shared>, keep: bool) {
         .map(|(ip, ts)| serde_json::json!({"ip": ip, "at_epoch": ts}))
         .collect();
     drop(spam);
-    let keys_meta = shared.keystore.lock().unwrap().meta();
-    let mode = shared.mode.lock().unwrap().clone();
+    let keys_meta = shared
+        .keystore
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .meta();
+    let mode = shared
+        .mode
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let upd = shared.updater.status();
     let (antiban_used, antiban_flagged, antiban_blocked) = shared.antiban.status();
     let body = serde_json::json!({
@@ -922,7 +949,7 @@ fn admin_keys(conn: &mut HttpConn, req: Request, path: &str, shared: &Arc<Shared
         .unwrap_or("")
         .to_string();
     let (code, body) = {
-        let mut ks = shared.keystore.lock().unwrap();
+        let mut ks = shared.keystore.lock().unwrap_or_else(|e| e.into_inner());
         match action {
             "add" => {
                 if key.is_empty() {
@@ -1005,11 +1032,15 @@ fn handle_chat(
 ) {
     // 1) anti-spam
     if let Some(w) = shared.limiter.check(peer).err() {
-        shared.stats.lock().unwrap().spam_blocked += 1;
+        shared
+            .stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spam_blocked += 1;
         shared
             .spam_log
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .push((peer_str.to_string(), now_epoch()));
         let body = err_body(
             &format!("anti-spam: trop de requetes, reessaie dans {w}s"),
@@ -1113,15 +1144,45 @@ fn handle_chat(
     };
     // AVEC tools (agent build) : la tâche réelle (audit, corrections,
     // multi-fichiers) prend 2-4 min — timeout dédié, PAS le 80 s texte.
+    //
+    // Mais 240 s est le Pire cas : un modèle qui HANG le fait attendre
+    // 4 min pour rien avant que la cascade passe au suivant (observé :
+    // 359 s pour une tâche de 10 s). On plafonne le timeout agent à
+    // 150 s : au-delà, une tâche agentique légitime n'a pas de réponse
+    // à temps de toute façon, et le client desktop coupe son tour bien
+    // avant.
     let call_timeout = if has_tools {
-        Duration::from_secs(240)
+        Duration::from_secs(150)
     } else {
         shared.call_timeout
     };
+    // DEADLINE GLOBALE DE LA CASCADE : sans elle, une cascade de 7
+    // modèles × 240 s = 28 min de silence avant la première réponse —
+    // le client (Hermes desktop) coupe son tour et le service paraît
+    // « muet ». Le budget total est borné : une seule tentative longue
+    // (240 s agent) ou 2-3 tentatives courtes (texte).
+    let cascade_deadline = Instant::now()
+        + if has_tools {
+            // agent : 1 tentative longue laisse 240 s ; la cascade entière
+            // ne doit pas dépasser 2× le timeout d'une tentative.
+            call_timeout * 2
+        } else {
+            // texte : 80 s par tentative, 3 tentatives max = 240 s.
+            call_timeout * 3
+        };
 
     // 3) cache
-    if let Some(text) = shared.cache.lock().unwrap().get(&model_req, &prompt) {
-        shared.stats.lock().unwrap().cache_hits += 1;
+    if let Some(text) = shared
+        .cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&model_req, &prompt)
+    {
+        shared
+            .stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cache_hits += 1;
         respond_chat(conn, &text, &model_req, wants_stream, keep);
         return;
     }
@@ -1157,7 +1218,11 @@ fn handle_chat(
     let _guard = match shared.gate.acquire(shared.gate_wait) {
         Some(g) => g,
         None => {
-            shared.stats.lock().unwrap().busy_rejected += 1;
+            shared
+                .stats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .busy_rejected += 1;
             let b = err_body("serveur occupe, reessaie", "rate_limit_error", Some(5));
             let _ = conn.write_response(
                 429,
@@ -1206,25 +1271,64 @@ fn handle_chat(
     }
     for _attempt in 0..chain.len() {
         let now = Instant::now();
+        // DEADLINE GLOBALE : si le budget total de la cascade est
+        // épuisé, on arrête de tenter d'autres modèles et on rend la main
+        // au client (erreur lisible) au lieu de le laisser attendre
+        // 7 × 240 s de silence.
+        if now >= cascade_deadline {
+            let msg = "delai global de la cascade depasse : aucun modele n'a repondu a temps";
+            if sse_open {
+                let e = serde_json::json!({"error": {
+                    "message": msg,
+                    "type": "upstream_error",
+                }});
+                sse_error_close(conn, &e);
+            } else {
+                let b = err_body(msg, "upstream_error", None);
+                // 502 (et non 504) : on PRÉSERVE le contrat HTTP déjà
+                // connu du client — une cascade épuisée répondait 502
+                // « Bad Gateway », le SDK OpenAI le traite comme une
+                // erreur 5xx retriable. Le message porte la cause
+                // précise (deadline globale).
+                let _ = conn.write_response(
+                    502,
+                    "Bad Gateway",
+                    "application/json",
+                    b.to_string().as_bytes(),
+                    &[],
+                    keep,
+                );
+            }
+            return;
+        }
         // (modèle, timeout effectif) : le robin intelligent renvoie un
         // timeout adaptatif par modèle ; les autres chemins gardent la base.
         // AVEC tools (agent build) : timeout adaptatif désactivé — l'agent
         // travaille 30-60 s+ sur une vraie tâche, un timeout court couperait
         // un travail en cours ; on garde la base pleine.
         let (model, effective_timeout) = {
-            let reg = shared.registry.lock().unwrap();
-            let mode = shared.mode.lock().unwrap().clone();
+            let reg = shared.registry.lock().unwrap_or_else(|e| e.into_inner());
+            let mode = shared
+                .mode
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let picked = if model_req == ROBIN_MODEL && !has_tools {
                 pick_robin_smart(
                     &chain,
                     &reg,
-                    &mut shared.rr_cursor.lock().unwrap(),
+                    &mut shared.rr_cursor.lock().unwrap_or_else(|e| e.into_inner()),
                     now,
                     call_timeout,
                 )
             } else if mode == "roundrobin" && !has_tools {
-                pick_round_robin(&chain, &reg, &mut shared.rr_cursor.lock().unwrap(), now)
-                    .map(|m| (m, call_timeout))
+                pick_round_robin(
+                    &chain,
+                    &reg,
+                    &mut shared.rr_cursor.lock().unwrap_or_else(|e| e.into_inner()),
+                    now,
+                )
+                .map(|m| (m, call_timeout))
             } else if model_req == ROBIN_MODEL {
                 // robin + tools : exploitation pure (pas d'exploration en
                 // pleine tâche lourde), timeout = base pleine
@@ -1267,8 +1371,17 @@ fn handle_chat(
                 }
             }
         };
+        // Le timeout effectif ne doit JAMAIS dépasser le reste du budget
+        // global : sinon une tentative unique peut blew la deadline
+        // (240 s de plus après un timeout de 200 s).
+        let effective_timeout =
+            effective_timeout.min(cascade_deadline.saturating_duration_since(now));
         // rotation de clé : round-robin parmi les actives, anonyme sinon
-        let key_choice = shared.keystore.lock().unwrap().select();
+        let key_choice = shared
+            .keystore
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .select();
         let api_key: Option<&str> = match &key_choice {
             KeyChoice::Use(k) => Some(k.as_str()),
             KeyChoice::Anonymous => None,
@@ -1341,14 +1454,18 @@ fn handle_chat(
             Ok(ok) => {
                 let lat = ok.elapsed;
                 {
-                    let mut reg = shared.registry.lock().unwrap();
+                    let mut reg = shared.registry.lock().unwrap_or_else(|e| e.into_inner());
                     reg.entry(model.clone()).or_default().note_success(lat);
                 }
                 if let KeyChoice::Use(k) = &key_choice {
-                    shared.keystore.lock().unwrap().note_success(k);
+                    shared
+                        .keystore
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .note_success(k);
                 }
                 {
-                    let mut s = shared.stats.lock().unwrap();
+                    let mut s = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
                     if is_fallback {
                         s.note_fallback(&model);
                     } else {
@@ -1358,7 +1475,7 @@ fn handle_chat(
                 shared
                     .cache
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .put(&model_req, &prompt, &ok.text);
                 if wants_stream {
                     // la réponse SSE est DÉJÀ entamée (rôle + keepalives) :
@@ -1407,7 +1524,7 @@ fn handle_chat(
                     shared.antiban.flag();
                 }
                 {
-                    let mut reg = shared.registry.lock().unwrap();
+                    let mut reg = shared.registry.lock().unwrap_or_else(|e| e.into_inner());
                     let cd = reg
                         .entry(model.clone())
                         .or_default()
@@ -1429,13 +1546,13 @@ fn handle_chat(
                 // clé invalidée seulement si le refus vient du compte (pas du modèle)
                 if let KeyChoice::Use(k) = &key_choice {
                     if kind != ErrorKind::ModelInvalid {
-                        let mut ks = shared.keystore.lock().unwrap();
+                        let mut ks = shared.keystore.lock().unwrap_or_else(|e| e.into_inner());
                         ks.note_failure(k, kind, KEY_BACKOFF);
                         let _ = ks.save();
                     }
                 }
                 {
-                    let mut s = shared.stats.lock().unwrap();
+                    let mut s = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
                     s.note_error(&model, kind == ErrorKind::Exhausted);
                 }
                 last_err = Some((
@@ -1479,7 +1596,7 @@ fn shared_backend_exe(shared: &Shared) -> String {
     shared
         .backend_exe_cell
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_default()
 }
@@ -1490,11 +1607,11 @@ fn load_state(shared: &Shared) {
         if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(s) = doc.get("stats") {
                 if let Ok(parsed) = serde_json::from_value::<Stats>(s.clone()) {
-                    *shared.stats.lock().unwrap() = parsed;
+                    *shared.stats.lock().unwrap_or_else(|e| e.into_inner()) = parsed;
                 }
             }
             if let Some(h) = doc.get("health").and_then(|v| v.as_object()) {
-                let mut reg = shared.registry.lock().unwrap();
+                let mut reg = shared.registry.lock().unwrap_or_else(|e| e.into_inner());
                 for (k, v) in h {
                     let failures = v.get("failures").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
                     let cd_secs = v.get("cooldown_secs").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -1516,9 +1633,13 @@ fn load_state(shared: &Shared) {
 fn periodic_save(shared: Arc<Shared>, interval: Duration) {
     loop {
         std::thread::sleep(interval);
-        let stats = shared.stats.lock().unwrap().clone();
+        let stats = shared
+            .stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         {
-            let reg = shared.registry.lock().unwrap();
+            let reg = shared.registry.lock().unwrap_or_else(|e| e.into_inner());
             let mut health = serde_json::Map::new();
             let now = Instant::now();
             for m in FREE_MODELS {
@@ -1541,7 +1662,7 @@ fn periodic_save(shared: Arc<Shared>, interval: Duration) {
                 eprintln!("[pauvre-router] save KO: {e}");
             }
         }
-        let ks = shared.keystore.lock().unwrap();
+        let ks = shared.keystore.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = ks.save() {
             eprintln!("[pauvre-router] keystore save KO: {e}");
         }
@@ -1578,7 +1699,11 @@ pub fn bind_server(cfg: &ServerConfig) -> std::io::Result<BoundServer> {
 
     let listener = TcpListener::bind(("127.0.0.1", cfg.port))?;
     let port = listener.local_addr()?.port();
-    let n_keys = shared.keystore.lock().unwrap().count();
+    let n_keys = shared
+        .keystore
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .count();
     eprintln!(
         "[pauvre-router] v{VERSION} sur http://127.0.0.1:{port} | workers fixes: {N_WORKERS}, file: {QUEUE_CAP} | keys pool: {n_keys} | cascade: {}",
         FREE_MODELS.join(" -> ")
@@ -1770,7 +1895,14 @@ mod tests {
         assert_eq!(shared.call_timeout, Duration::from_millis(10));
         assert_eq!(shared.gate_wait, Duration::from_millis(3));
         assert_eq!(shared.backend_env.len(), 1);
-        assert_eq!(shared.mode.lock().unwrap().as_str(), "roundrobin");
+        assert_eq!(
+            shared
+                .mode
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_str(),
+            "roundrobin"
+        );
         assert_eq!(shared_backend_exe(&shared), "nope.exe", "exe figé au boot");
         let _ = std::fs::remove_dir_all(&dir);
     }

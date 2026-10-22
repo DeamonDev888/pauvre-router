@@ -51,6 +51,17 @@ pub fn classify(raw: &str) -> ErrorKind {
     if exhausted.iter().any(|k| l.contains(k)) {
         return ErrorKind::Exhausted;
     }
+    // "Unexpected server error" = erreur GÉNÉRIQUE de la gateway amont
+    // (panne serveur chez opencode), PAS un modèle inconnu. Elle doit
+    // être distinguée AVANT le bucket "invalid" : le message contient
+    // « not available » dans certaines variantes → sinon on clouait un
+    // modèle VALIDE pendant 1 h (COOLDOWN_MODEL_INVALID) sur un simple
+    // hiccup de la gateway. Symptôme vu en prod : minimax-m3.1-flash-free
+    // et longcat-2.5-preview-free « UnknownError / Unexpected server
+    // error » → cd=3600 s, alors que ces modèles répondent par ailleurs.
+    if l.contains("unexpected server error") {
+        return ErrorKind::Transient;
+    }
     let invalid = [
         "unknown model",
         "unknownerror",
@@ -128,7 +139,7 @@ mod tests {
     fn model_invalide_detecte() {
         assert_eq!(
             classify("Error: {\"name\":\"UnknownError\",\"data\":{\"message\":\"Unexpected server error.\"}}"),
-            ErrorKind::ModelInvalid
+            ErrorKind::Transient
         );
         assert_eq!(classify("unknown model: toto"), ErrorKind::ModelInvalid);
     }

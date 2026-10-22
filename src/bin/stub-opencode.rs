@@ -1,15 +1,57 @@
 //! Stub `opencode` pour les tests E2E — n'est JAMAIS livré en prod.
 //!
+//! Il reproduit le format du VRAI CLI : `opencode run --format json`
+//! émet une ligne JSON par événement (`text`, `tool_use`, `error`…).
+//! Le routeur parse ce format ([`pauvre_router::ocjson`]) : le stub
+//! doit donc être FIDÈLE, sinon les tests E2E valideraient un chemin
+//! que la prod n'emprunte pas.
+//!
 //! Décision de réponse :
 //! - env `STUB_FAIL` (liste CSV de modèles, posée par la config serveur
 //!   du test) : le modèle courant (`--model`, préfixé `opencode/`) se
-//!   termine par l'un d'eux → exit 1 avec une erreur d'exhaustion ;
+//!   termine par l'un d'eux → événement `error` + exit 1 ;
 //! - prompt `SLOW <ms>` : dort puis répond (déclenche le timeout routeur) ;
 //! - prompt `ECHOKEY...` : renvoie OPENCODE_API_KEY reçu (ou ANONYMOUS) —
 //!   preuve de la rotation de clés ;
-//! - sinon : echo `ack <model>: <prompt>` — preuve du chemin complet.
+//! - prompt `TOOLLOG <texte>` : émet un `tool_use` (journal d'outils)
+//!   AVANT la réponse — prouve que le journal NE FUIT PAS au client ;
+//! - sinon : `text` = `ack <model>: <prompt>` — preuve du chemin complet.
 
 use std::io::Read;
+
+/// Émet un événement JSON sur stdout (une ligne par événement).
+fn emit(ev: &str) {
+    println!("{ev}");
+}
+
+/// Construit un événement `text` JSON (échappement minimal des cas
+/// courants : `"` et `\` et retour chariot).
+fn text_event(text: &str) -> String {
+    let escaped = text
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n");
+    format!(
+        "{{\"type\":\"text\",\"timestamp\":1,\"part\":{{\"id\":\"prt_1\",\"type\":\"text\",\"text\":\"{escaped}\"}}}}"
+    )
+}
+
+/// Construit un événement `error` JSON.
+fn error_event(name: &str, message: &str) -> String {
+    let escaped = message
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n");
+    format!(
+        "{{\"type\":\"error\",\"timestamp\":1,\"error\":{{\"name\":\"{name}\",\"data\":{{\"message\":\"{escaped}\"}}}}}}"
+    )
+}
+
+/// Événement `tool_use` figé — le journal d'outils que le routeur doit
+/// JETER (il ne doit jamais atteindre le client).
+const TOOL_USE_EVENT: &str = "{\"type\":\"tool_use\",\"timestamp\":1,\"part\":{\"id\":\"prt_tool\",\"type\":\"tool\",\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"echo SECRETLOG\"},\"output\":\"SECRETLOG\"}}}";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -33,20 +75,24 @@ fn main() {
     if let Some(rest) = q.strip_prefix("SLOW ") {
         let ms: u64 = rest.trim().parse().unwrap_or(50);
         std::thread::sleep(std::time::Duration::from_millis(ms));
-        println!("slow done {model}");
+        emit(&text_event(&format!("slow done {model}")));
         return;
     }
 
     if q.starts_with("FLAGGED") {
-        eprintln!(
-            "Error: OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address. This isn't related to your account. If you're on a VPN or proxy, turn it off and try again, or subscribe to OpenCode Go at https://opencode.ai/go to keep building."
-        );
+        emit(&error_event(
+            "ProviderAuthError",
+            "OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address. This isn't related to your account.",
+        ));
         std::process::exit(1);
     }
 
     if let Some(rest) = q.strip_prefix("COOLDOWN ") {
         let secs: u64 = rest.trim().parse().unwrap_or(30);
-        eprintln!("Error: rate limit exceeded, retry after {secs} seconds");
+        emit(&error_event(
+            "RateLimitError",
+            &format!("rate limit exceeded, retry after {secs} seconds"),
+        ));
         std::process::exit(1);
     }
 
@@ -57,19 +103,33 @@ fn main() {
             .any(|m| !m.trim().is_empty() && model.ends_with(m.trim()));
 
     if should_fail {
-        eprintln!(
-            "Error: {{\"name\":\"UsageLimitError\",\"data\":{{\"message\":\"Free usage limit exceeded for {model}\"}}}}"
-        );
+        emit(&error_event(
+            "UsageLimitError",
+            &format!("Free usage limit exceeded for {model}"),
+        ));
         std::process::exit(1);
     }
 
     if q.starts_with("ECHOKEY") {
-        match std::env::var("OPENCODE_API_KEY") {
-            Ok(k) if !k.is_empty() => println!("KEY={k} model={model}"),
-            _ => println!("KEY=ANONYMOUS model={model}"),
-        }
+        let key = std::env::var("OPENCODE_API_KEY").unwrap_or_default();
+        let shown = if key.is_empty() {
+            "ANONYMOUS".to_string()
+        } else {
+            key
+        };
+        emit(&text_event(&format!("KEY={shown} model={model}")));
         return;
     }
 
-    println!("ack {model}: {q}");
+    // Journal d'outils AVANT la réponse : le routeur doit le JETER et ne
+    // servir que la réponse (régression du bug « journal servi au
+    // client desktop »).
+    if let Some(rest) = q.strip_prefix("TOOLLOG ") {
+        let payload = rest.trim().replace('"', "'");
+        emit(TOOL_USE_EVENT);
+        emit(&text_event(&format!("ack {model}: {payload}")));
+        return;
+    }
+
+    emit(&text_event(&format!("ack {model}: {q}")));
 }

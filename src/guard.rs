@@ -32,7 +32,7 @@ impl RateLimiter {
     }
 
     pub fn check_at(&self, ip: IpAddr, now: Instant) -> Result<(), u64> {
-        let mut m = self.buckets.lock().unwrap();
+        let mut m = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         let rate_per_sec = self.per_min / 60.0;
         let b = m.entry(ip).or_insert(Bucket {
             tokens: self.capacity,
@@ -65,7 +65,7 @@ pub struct GateGuard<'a> {
 
 impl Drop for GateGuard<'_> {
     fn drop(&mut self) {
-        let mut cur = self.gate.cur.lock().unwrap();
+        let mut cur = self.gate.cur.lock().unwrap_or_else(|e| e.into_inner());
         *cur = cur.saturating_sub(1);
         self.gate.cv.notify_one();
     }
@@ -82,7 +82,7 @@ impl Gate {
 
     /// Acquiert un slot ou None après `wait`.
     pub fn acquire(&self, wait: Duration) -> Option<GateGuard<'_>> {
-        let mut cur = self.cur.lock().unwrap();
+        let mut cur = self.cur.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = Instant::now() + wait;
         while *cur >= self.max {
             let now = Instant::now();
@@ -92,7 +92,7 @@ impl Gate {
             let (c, _t) = self
                 .cv
                 .wait_timeout(cur, deadline.saturating_duration_since(now))
-                .unwrap();
+                .unwrap_or_else(|e| e.into_inner());
             cur = c;
         }
         *cur += 1;

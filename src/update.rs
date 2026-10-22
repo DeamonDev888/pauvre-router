@@ -58,7 +58,10 @@ impl Updater {
 
     /// Dernier état connu (jamais bloquant).
     pub fn status(&self) -> UpdateStatus {
-        self.status.lock().unwrap().clone()
+        self.status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Check synchrone (6 s max) : interroge l'API GitHub Releases.
@@ -81,7 +84,7 @@ impl Updater {
                     url,
                     checked_at_epoch: epoch_now(),
                 };
-                *self.status.lock().unwrap() = next.clone();
+                *self.status.lock().unwrap_or_else(|e| e.into_inner()) = next.clone();
                 self.inflight.store(0, Ordering::Relaxed);
                 next
             }

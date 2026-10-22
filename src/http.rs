@@ -199,7 +199,7 @@ impl HttpConn {
             while remaining > 0 && Instant::now() < deadline {
                 match self.reader.read(&mut sink) {
                     Ok(0) => break,
-                    Ok(n) => remaining -= n,
+                    Ok(n) => remaining = remaining.saturating_sub(n),
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -289,7 +289,7 @@ impl HttpConn {
                 }
                 return Ok(body);
             }
-            if body.len() + size > max_body {
+            if size > max_body || body.len().saturating_add(size) > max_body {
                 return Err(HttpError::TooLarge);
             }
             let start = body.len();

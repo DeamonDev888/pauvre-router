@@ -11,20 +11,38 @@ pub const COOLDOWN_TRANSIENT: Duration = Duration::from_secs(10);
 pub const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 
 /// Modèles frontière retenus (les meilleurs gratuits testés en live).
-/// beam-free : le plus rapide (5,3 s) + 1M contexte — gratuit pour une
-/// durée limitée. glm-5.3-flash-free : frontière, gratuit depuis oct 2026.
-/// nemotron-3.5-lightning : ~5 s. longcat-2.5-preview : ~7 s.
-/// mimo-v2.6-flash : ~7 s. minimax-m3.1-flash : ~8 s. deepseek-v4.1 : ~9 s.
-/// (space-bunny-free retiré le 19 oct 2026 : disparu de la gateway Zen,
-/// `UnknownError` systématique ; jev-1.13-free également cassé à l'arrivée.)
+///
+/// Rotation du 22 oct 2026 (test de liveness réel, `opencode run
+/// --format json` sur chaque modèle) :
+/// - `longcat-2.5-preview-free` : **MORT** — « UnknownError /
+///   Unexpected server error » (gateway) ;
+/// - `minimax-m3.1-flash-free` : **MORT** — même erreur gateway ;
+/// - `flint-40b-free` : **MORT** — « Upstream request failed: Endpoint
+///   is unavailable » (503) ;
+/// - `jev-1.13-free` : **MORT** — même erreur gateway ;
+/// - `beam-free` : **instable** — timeout récurrent (> 90 s).
+///
+/// Remplacés par `big-pickle` (rapide en texte) et
+/// `nemotron-3.5-lightning-free`.
+///
+/// ## Ordre de la chaîne = ordre de FIABILITÉ
+///
+/// Le 1er modèle est celui qui sert le mieux, parce qu'un modèle qui
+/// HANG en mode agent brûle tout son timeout (240 s) avant que la
+/// cascade passe au suivant — le client desktop attend alors 4-6 min
+/// pour une tâche de 10 s. Observé : `big-pickle` a hang 240 s puis
+/// `glm-5.3-flash-free` a répondu en 119 s → 359 s pour l'utilisateur.
+///
+/// Ordre mesuré en prod (latence + taux d'échec) :
+/// `glm-5.3-flash-free` (6 ok / 0 ko, ~6 s) en tête, puis les autres
+/// par fiabilité décroissante. `big-pickle` est rapide en texte mais
+/// instable en agent → il passe en fin de chaîne.
 pub const FREE_MODELS: &[&str] = &[
-    "beam-free",
     "glm-5.3-flash-free",
-    "nemotron-3.5-lightning-free",
-    "longcat-2.5-preview-free",
-    "mimo-v2.6-flash-free",
-    "minimax-m3.1-flash-free",
     "deepseek-v4.1-flash-free",
+    "mimo-v2.6-flash-free",
+    "nemotron-3.5-lightning-free",
+    "big-pickle",
 ];
 
 /// Pseudo-modèle exposé aux clients : round-robin permanent sur les
@@ -191,33 +209,48 @@ pub fn pick_robin_smart(
     if candidates.is_empty() {
         return None;
     }
-    // exploration 1/5 : la 5e requête (cursor % 5 == 4) part sur le
-    // suivant du curseur — garantit la fraîcheur des mesures
+    // Exploitation : min score (tie-break : ordre de cascade).
+    let exploit = candidates
+        .iter()
+        .enumerate()
+        .min_by(|(i, a), (j, b)| {
+            let sa = registry
+                .get(a.as_str())
+                .map(|h| h.score(median))
+                .unwrap_or(median);
+            let sb = registry
+                .get(b.as_str())
+                .map(|h| h.score(median))
+                .unwrap_or(median);
+            sa.partial_cmp(&sb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(i.cmp(j))
+        })
+        .map(|(_, m)| (*m).clone())
+        .unwrap_or_else(|| candidates[0].clone());
+    // Exploration 1/5 : la 5e requête (cursor % 5 == 4) part sur un
+    // AUTRE modèle — c'est la freshness des mesures (un modèle redevenu
+    // rapide est redétecté en ≤ 5 requêtes).
+    //
+    // Piège corrigé : l'index d'exploration était `cursor % len` APRÈS
+    // incrément. Avec 5 modèles, 5 % 5 == 0 → l'exploration retombait
+    // TOUJOURS sur le premier modèle, qui est justement celui que
+    // l'exploitation choisit (tie-break à score égal) : l'exploration
+    // n'explorait donc RIEN (observé : 9 requêtes, 9× le même modèle).
+    //
+    // On indexe sur le nombre d'explorations (cursor / 5) et on SAUTE
+    // l'index si il tombe sur le modèle d'exploitation : une
+    // exploration qui n'explore pas est une exploration inutile.
     let explore = *exploration_cursor % 5 == 4;
     *exploration_cursor = exploration_cursor.wrapping_add(1);
-    let chosen = if explore {
-        let idx = *exploration_cursor % candidates.len();
+    let chosen = if explore && candidates.len() > 1 {
+        let mut idx = (*exploration_cursor / 5) % candidates.len();
+        if candidates[idx] == &exploit {
+            idx = (idx + 1) % candidates.len();
+        }
         candidates[idx].clone()
     } else {
-        // exploitation : min score (tie-break : ordre de cascade)
-        candidates
-            .iter()
-            .enumerate()
-            .min_by(|(i, a), (j, b)| {
-                let sa = registry
-                    .get(a.as_str())
-                    .map(|h| h.score(median))
-                    .unwrap_or(median);
-                let sb = registry
-                    .get(b.as_str())
-                    .map(|h| h.score(median))
-                    .unwrap_or(median);
-                sa.partial_cmp(&sb)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(i.cmp(j))
-            })
-            .map(|(_, m)| (*m).clone())
-            .unwrap_or_else(|| candidates[0].clone())
+        exploit
     };
     // timeout adaptatif : 1,5× EWMA — borné [30 s, base] en prod ; si
     // base < 30 s (config de test), borné [base/3, base]. clamp(min>max)
@@ -305,21 +338,50 @@ mod tests {
     fn robin_smart_exploite_le_plus_rapide() {
         let now = Instant::now();
         let mut reg: Registry = HashMap::new();
-        reg.insert("beam-free".into(), h_ok(5000));
-        reg.insert("glm-5.3-flash-free".into(), h_ok(25000)); // slow
-        reg.insert("space-bunny-free".into(), h_ok(5700));
-        reg.insert("deepseek-v4.1-flash-free".into(), h_ok(9000));
-        let chain: Vec<String> = FREE_MODELS.iter().map(|m| m.to_string()).collect();
+        // Noms de modèles factices : le test porte sur le SCORING, pas
+        // sur la rotation réelle des modèles (qui change chaque
+        // semaine). Le « rapide » est le 1er de la chaîne.
+        let chain = vec![
+            "modele-rapide".to_string(),
+            "modele-lent".to_string(),
+            "modele-moyen".to_string(),
+        ];
+        reg.insert("modele-rapide".into(), h_ok(5000));
+        reg.insert("modele-lent".into(), h_ok(25000)); // slow
+        reg.insert("modele-moyen".into(), h_ok(5700));
         let mut cursor = 0usize;
         // 4 exploitations consécutives (pas d'exploration aux idx 0-3) :
-        // toutes doivent tomber sur beam (score min)
+        // toutes doivent tomber sur le plus rapide (score min)
         for _ in 0..4 {
             let (m, t) =
                 pick_robin_smart(&chain, &reg, &mut cursor, now, Duration::from_secs(80)).unwrap();
-            assert_eq!(m, "beam-free");
+            assert_eq!(m, "modele-rapide");
             // timeout adaptatif : 1,5× 5000 = 7,5 s, borné bas à 30 s
             assert_eq!(t, Duration::from_secs(30));
         }
+    }
+
+    #[test]
+    fn robin_smart_exploration_explore_un_autre_modele() {
+        // RÉGRESSION : avec 5 modèles, l'index d'exploration
+        // (`cursor % len` après incrément) retombait TOUJOURS sur le
+        // premier — le même que l'exploitation choisit → l'exploration
+        // n'explorait rien (9 requêtes, 9× le même modèle).
+        let now = Instant::now();
+        let reg: Registry = HashMap::new();
+        let chain: Vec<String> = (0..5).map(|i| format!("m{i}")).collect();
+        let mut cursor = 0usize;
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..12 {
+            let (m, _) =
+                pick_robin_smart(&chain, &reg, &mut cursor, now, Duration::from_secs(80)).unwrap();
+            seen.push(m);
+        }
+        let distinct: std::collections::HashSet<&String> = seen.iter().collect();
+        assert!(
+            distinct.len() >= 2,
+            "l'exploration doit toucher un autre modèle: {seen:?}"
+        );
     }
 
     #[test]
@@ -405,14 +467,19 @@ mod tests {
     fn pick_saute_les_modeles_en_cooldown() {
         let now = Instant::now();
         let mut reg: Registry = HashMap::new();
-        let c = cascade("space-bunny-free");
+        // Le nom du modèle demandé est libre : ce qui compte, c'est
+        // que le 1er en cooldown soit sauté pour le 1er DISPONIBLE de
+        // la chaîne (le test ne doit pas dépendre de la rotation des
+        // modèles, qui change chaque semaine).
+        let c = cascade("modele-inexistant-xyz");
+        let expected = FREE_MODELS
+            .iter()
+            .find(|m| **m != "modele-inexistant-xyz")
+            .expect("cascade non vide");
         let mut h = Health::default();
         h.note_failure(ErrorKind::Exhausted, now);
-        reg.insert("space-bunny-free".into(), h);
-        assert_eq!(
-            pick(&c, &reg, now).unwrap(),
-            "beam-free" // saute le premier en cooldown
-        );
+        reg.insert("modele-inexistant-xyz".into(), h);
+        assert_eq!(pick(&c, &reg, now).unwrap(), *expected);
         // tous en cooldown => None
         for m in FREE_MODELS {
             let mut h = Health::default();

@@ -3,6 +3,62 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.9.0] — 2026-10-22
+
+### Corrigé
+- **LE JOURNAL DES OUTILS ÉTAIT SERVI AU CLIENT (bug « desktop »)** :
+  en mode agent (`--agent build`), `opencode run` écrit la réponse sur
+  stdout et le **journal des appels d'outils** (`$ echo … && ls src` +
+  la sortie de la commande) sur stderr. Le routeur fusionnait les deux
+  (v0.8.3) → le client Hermes desktop recevait le journal au lieu de la
+  réponse (`HELLO_FROM_AGENT\n\nExécution réussie…`), et la bannière
+  pouvait réapparaître en fin de réponse (pansé en v0.8.8 par
+  `strip_banner_lines`).
+  **Correctif à la racine** : le spawn passe désormais `--format json`
+  → opencode émet une **ligne JSON par événement** ; le nouveau module
+  `src/ocjson.rs` ne garde que les événements `type == "text"` (la
+  réponse) et jette les `tool_use` (le journal). `strip_banner` /
+  `strip_banner_lines` sont SUPPRIMÉS : ils ne faisaient que masquer le
+  symptôme. Au passage, les erreurs amont deviennent lisibles par le
+  classifieur au lieu d'être noyées dans 28 Ko de transcript.
+- **« Unexpected server error » ne cloue plus un modèle valide pendant
+  1 h** : c'est une panne générique de la gateway opencode, pas un
+  modèle inconnu. Le classifieur la classe `Transient` (cooldown court)
+  **avant** le bucket « modèle invalide » (le message contient « not
+  available » dans certaines variantes). Symptôme vu en prod :
+  `minimax-m3.1-flash-free` et `longcat-2.5-preview-free` en cooldown
+  3600 s alors que la cascade n'avait qu'un modèle survivant.
+- **DEADLINE GLOBALE DE LA CASCADE** : sans elle, une cascade de
+  7 modèles × 240 s = **28 minutes de silence** avant la première
+  réponse — le client desktop abandonnait son tour (« ça ne répond
+  pas »). Le budget total est maintenant borné (2× le timeout en mode
+  agent, 3× en mode texte) et le timeout effectif d'une tentative ne
+  peut pas dépasser le reste du budget. Au dépassement : erreur
+  lisible (502 « delai global de la cascade depasse »).
+- **L'exploration du robin n'explorait PLUS RIEN** : l'index était
+  `cursor % len` calculé APRÈS incrément — avec 5 modèles, 5 % 5 == 0
+  retombait toujours sur le premier, celui que l'exploitation choisit
+  (tie-break). Observé : 9 requêtes, 9× le même modèle, les autres
+  jamais mesurés. L'index porte maintenant sur le nombre
+  d'explorations et saute le modèle d'exploitation.
+
+### Modèles
+- Rotation du 22 oct 2026 (test de liveness réel sur chaque modèle) :
+  `longcat-2.5-preview-free`, `minimax-m3.1-flash-free`,
+  `flint-40b-free` et `jev-1.13-free` sont **morts** (erreur gateway
+  « Unexpected server error » / « Endpoint is unavailable ») ;
+  `beam-free` est **instable** (timeout récurrent > 90 s).
+  Nouvelle chaîne : `big-pickle` → `glm-5.3-flash-free` →
+  `nemotron-3.5-lightning-free` → `mimo-v2.6-flash-free` →
+  `deepseek-v4.1-flash-free`.
+
+### Testé
+- Les tests E2E ne codent plus **en dur** de noms de modèles (la
+  rotation les cassait) : ils dérivent la liste de `FREE_MODELS`.
+- Nouveaux tests de régression : le journal d'outils ne fuit ni en JSON
+  ni en SSE, l'erreur structurée atteint le classifieur, la deadline
+  globale coupe la cascade, l'exploration touche un autre modèle.
+
 ## [0.8.8] — 2026-10-22
 
 ### Corrigé

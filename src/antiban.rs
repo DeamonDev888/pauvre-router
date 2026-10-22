@@ -58,13 +58,13 @@ impl AntiBan {
 
     /// Budget effectif (après plancher).
     pub fn budget(&self) -> usize {
-        *self.budget.read().unwrap()
+        *self.budget.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Change le budget à chaud (admin) — planché à [`MIN_BUDGET`].
     /// Retourne la valeur appliquée.
     pub fn set_budget(&self, want: usize) -> usize {
-        let mut b = self.budget.write().unwrap();
+        let mut b = self.budget.write().unwrap_or_else(|e| e.into_inner());
         *b = want.max(MIN_BUDGET);
         *b
     }
@@ -81,7 +81,7 @@ impl AntiBan {
             return Err(wait);
         }
         // 2) budget fenêtre glissante
-        let mut calls = self.calls.lock().unwrap();
+        let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(front) = calls.front() {
             if now.duration_since(*front) >= WINDOW {
                 calls.pop_front();
@@ -90,7 +90,7 @@ impl AntiBan {
             }
         }
         if calls.len() >= self.budget() {
-            let front = *calls.front().unwrap();
+            let front = *calls.front().unwrap_or_else(|| unreachable!());
             let wait = (WINDOW - now.duration_since(front)).as_secs().max(1);
             return Err(wait);
         }
@@ -104,7 +104,10 @@ impl AntiBan {
     }
 
     pub fn flag_at(&self, now: Instant) {
-        *self.blocked_until.write().unwrap() = Some(now + FLAGGED_PAUSE);
+        *self
+            .blocked_until
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(now + FLAGGED_PAUSE);
     }
 
     /// Pendant un flag, un cooldown amont `secs` prolonge la coupure
@@ -116,7 +119,10 @@ impl AntiBan {
     }
 
     pub fn cooldown_changed_at(&self, now: Instant, secs: u64) {
-        let mut b = self.blocked_until.write().unwrap();
+        let mut b = self
+            .blocked_until
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(t) = *b {
             if now < t {
                 let want = now + Duration::from_secs((secs * 2).max(60));
@@ -130,7 +136,10 @@ impl AntiBan {
 
     /// Succès backend : referme le circuit et purge le flag.
     pub fn release(&self) {
-        *self.blocked_until.write().unwrap() = None;
+        *self
+            .blocked_until
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub fn is_flagged(&self) -> bool {
@@ -138,7 +147,7 @@ impl AntiBan {
     }
 
     pub fn is_flagged_at(&self, now: Instant) -> bool {
-        match *self.blocked_until.read().unwrap() {
+        match *self.blocked_until.read().unwrap_or_else(|e| e.into_inner()) {
             Some(t) => now < t,
             None => false,
         }
@@ -150,13 +159,13 @@ impl AntiBan {
     }
 
     pub fn status_at(&self, now: Instant) -> (usize, bool, u64) {
-        let n = self.calls.lock().unwrap().len();
+        let n = self.calls.lock().unwrap_or_else(|e| e.into_inner()).len();
         let blocked = self.blocked_wait(now);
         (n, blocked.is_some(), blocked.unwrap_or(0))
     }
 
     fn blocked_wait(&self, now: Instant) -> Option<u64> {
-        match *self.blocked_until.read().unwrap() {
+        match *self.blocked_until.read().unwrap_or_else(|e| e.into_inner()) {
             Some(t) if now < t => Some((t - now).as_secs().max(1)),
             _ => None,
         }

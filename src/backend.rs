@@ -1,5 +1,21 @@
 //! Backend : spawn direct de `opencode.exe run` (le client officiel passe
 //! la gate fingerprint Zen). stdin = prompt, stdout = texte de réponse.
+//!
+//! ## Format de sortie : `--format json` (obligatoire)
+//!
+//! Le CLI accepte `--format json` : il émet alors une **ligne JSON par
+//! événement** (voir [`crate::ocjson`]). On l'utilise TOUJOURS, y compris
+//! en mode texte, parce que :
+//!
+//! - en mode **agent** (`--agent build`, le client déclare des tools), la
+//!   sortie `default` mélange la réponse et le **journal des outils** sur
+//!   stderr — le client recevait le journal au lieu de la réponse (bug
+//!   desktop) ;
+//! - les erreurs amont (« Unexpected server error ») sont **lisibles** au
+//!   classifieur au lieu d'être noyées dans 28 Ko de transcript.
+//!
+//! On garde `--format json` partout : un seul format, un seul parseur
+//! ([`crate::ocjson::parse_events`]), zéro ambiguïté.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -139,6 +155,11 @@ fn call_at_inner(
         agent,
         "--model",
         &format!("opencode/{model}"),
+        // sortie en événements JSON : c'est le seul format qui permet
+        // d'isoler la RÉPONSE du journal des outils (mode agent) et de
+        // lire les erreurs amont sans les noyer dans le transcript.
+        "--format",
+        "json",
     ]);
     // Workdir du client (extrait du system prompt) : l'agent build ne
     // lit/écrit QUE dans son cwd — sans ça il se fait auto-rejeter sur
@@ -225,39 +246,62 @@ fn call_at_inner(
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 let elapsed = timeout.saturating_sub(remaining);
                 if status.success() {
-                    // MODE AGENT : la réponse de l'agent et la transcription
-                    // de ses outils sortent sur STDERR (28 Ko vus en prod),
-                    // stdout n'a que la bannière ANSI. On traite les deux
-                    // comme UNE transcription — sinon on jette la réponse
-                    // réelle et on rate le texte au client.
-                    let out_clean = strip_ansi(&out);
-                    let mut combined = out_clean.trim().to_string();
-                    if !err.is_empty() {
-                        if !combined.is_empty() {
-                            combined.push_str("\n\n");
+                    // La sortie `--format json` ne mélange plus la réponse
+                    // et le journal des outils : on ne garde que les
+                    // événements `text` (la réponse) et on jette les
+                    // `tool_use` (le journal). Le journal MEURT ici :
+                    // c'était lui que le client desktop recevait.
+                    let parsed = crate::ocjson::parse_events(&out);
+                    match parsed {
+                        crate::ocjson::Parsed::Text(text) => {
+                            return Ok(BackendOk { text, elapsed });
                         }
-                        combined.push_str(strip_ansi(&err).trim());
-                    }
-                    let text = strip_banner(&strip_banner_lines(&combined));
-                    if text.is_empty() {
-                        // succès SANS texte : diagnostic (bannière seule ?
-                        // stdout vide ?) — vu en prod le 21 oct, réponse
-                        // vide instantanée servie au client
-                        eprintln!(
-                            "[pauvre-router] backend success VIDE: out={}b err={}b",
-                            out.len(),
-                            err.len()
-                        );
-                        if !err.is_empty() {
-                            return Err(BackendError::Failed { raw: err, elapsed });
+                        crate::ocjson::Parsed::Error(msg) => {
+                            // erreur amont STRUCTURÉE : elle doit atteindre
+                            // le classifieur (cooldown, cascade), pas être
+                            // noyée dans 28 Ko de transcript.
+                            return Err(BackendError::Failed { raw: msg, elapsed });
+                        }
+                        crate::ocjson::Parsed::Empty => {
+                            // Aucun événement exploitable. Le CLI a pu
+                            // écrire sur stderr (bannière, message) :
+                            // on le passe au classifieur s'il contient une
+                            // erreur, sinon on signale une réponse vide.
+                            let fallback = strip_ansi(&err);
+                            if !fallback.trim().is_empty() {
+                                return Err(BackendError::Failed {
+                                    raw: fallback,
+                                    elapsed,
+                                });
+                            }
+                            eprintln!(
+                                "[pauvre-router] backend success VIDE: out={}b err={}b",
+                                out.len(),
+                                err.len()
+                            );
+                            return Ok(BackendOk {
+                                text: String::new(),
+                                elapsed,
+                            });
                         }
                     }
-                    return Ok(BackendOk { text, elapsed });
                 }
-                let mut raw = err;
-                if raw.is_empty() {
-                    raw = out;
-                }
+                // ÉCHEC (exit != 0) : l'erreur amont est dans les
+                // événements JSON (`type == "error"`) ou, à défaut, dans
+                // stderr. On privilégie l'événement JSON : c'est lui qui
+                // porte le message exploitable (« UnknownError /
+                // Unexpected server error », « UsageLimitError »…).
+                let parsed = crate::ocjson::parse_events(&out);
+                let raw = match parsed {
+                    crate::ocjson::Parsed::Error(msg) => msg,
+                    _ => {
+                        let mut raw = strip_ansi(&err);
+                        if raw.trim().is_empty() {
+                            raw = strip_ansi(&out);
+                        }
+                        raw
+                    }
+                };
                 return Err(BackendError::Failed { raw, elapsed });
             }
             Ok(None) => {
@@ -279,16 +323,21 @@ fn call_at_inner(
 }
 
 /// Retire les séquences d'échappement ANSI (couleurs opencode : \x1b[0m
-/// etc.) — sinon strip_banner rate la bannière et le texte part avec ses
-/// codes de contrôle au client.
+/// etc.) — sinon le texte part avec ses codes de contrôle au client.
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\u{1b}' {
-            // \x1b[ ... lettre finale
+            // \\x1b[ ... lettre finale (borne : on ne mange JAMAIS le reste
+            // du texte si la sequence est malformee / sans lettre finale)
+            let mut consumed = 0usize;
             for n in chars.by_ref() {
+                consumed += 1;
                 if n.is_ascii_alphabetic() {
+                    break;
+                }
+                if consumed >= 32 {
                     break;
                 }
             }
@@ -299,47 +348,9 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Retire la bannière `> build · model` (première ligne) + trim.
-pub fn strip_banner(out: &str) -> String {
-    let mut s = out.trim().to_string();
-    if let Some(rest) = s.strip_prefix('>') {
-        if let Some(nl) = rest.find('\n') {
-            s = rest[nl + 1..].trim().to_string();
-        }
-    }
-    s
-}
-
-/// Retire TOUTES les lignes-bannières de la forme `> build · <modèle>` /
-/// `> plan · <modèle>` — depuis la fusion stdout+stderr, la bannière
-/// (stderr) n'est plus forcément EN TÊTE de la transcription : elle peut
-/// traîner à la fin d'une réponse sinon (vu en prod : « ROUTEUR-OK
-/// \n\n> plan · beam-free »).
-pub fn strip_banner_lines(out: &str) -> String {
-    let kept: Vec<&str> = out
-        .lines()
-        .filter(|l| {
-            let t = l.trim();
-            let banner = (t.starts_with("> build · ") || t.starts_with("> plan · "))
-                // il faut un nom de modèle derrière le « · »
-                && t.split(" · ").nth(1).map(|m| !m.trim().is_empty()).unwrap_or(false);
-            !banner
-        })
-        .collect();
-    kept.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn banner_retiree() {
-        assert_eq!(strip_banner("> build · space-bunny-free\npong"), "pong");
-        assert_eq!(strip_banner("pas de bannière"), "pas de bannière");
-        assert_eq!(strip_banner("> build\n\nmulti\nlignes"), "multi\nlignes");
-        assert_eq!(strip_banner("  "), "");
-    }
 
     #[test]
     fn opencode_path_env_override() {

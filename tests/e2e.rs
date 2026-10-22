@@ -206,12 +206,18 @@ fn e2e_health_et_models() {
         .iter()
         .filter_map(|m| m["id"].as_str())
         .collect();
-    assert_eq!(ids.len(), 8, "robin + 7 frontieres: {ids:?}");
+    // Le nombre de modèles listés suit la rotation (FREE_MODELS) : le
+    // test ne doit pas coder en dur une liste qui change chaque
+    // semaine.
+    assert_eq!(
+        ids.len(),
+        FREE_MODELS.len() + 1,
+        "robin + les frontieres: {ids:?}"
+    );
     assert!(ids.contains(&"frontier-robin-free"));
-    assert!(ids.contains(&"beam-free"));
-    assert!(ids.contains(&"glm-5.3-flash-free"));
-    assert!(ids.contains(&"longcat-2.5-preview-free"));
-    assert!(ids.contains(&"deepseek-v4.1-flash-free"));
+    for m in FREE_MODELS {
+        assert!(ids.contains(m), "le modele {m} doit etre liste: {ids:?}");
+    }
 }
 
 #[test]
@@ -285,13 +291,68 @@ fn e2e_chat_sse_stream() {
     );
 }
 
+/// RÉGRESSION du bug « desktop » : le journal des outils de l'agent
+/// (stdout/stderr de `opencode --agent build`) était servi AU CLIENT au
+/// lieu de la réponse. Le stub émet un événement `tool_use` AVANT le
+/// `text` : le routeur doit le JETER et ne servir que la réponse.
+#[test]
+fn e2e_journal_des_outils_ne_fuit_pas_au_client() {
+    let i = start("toollog", |_| {});
+    let (code, v) = chat(i.port, "glm-5.3-flash-free", "TOOLLOG PONG").unwrap();
+    assert_eq!(code, 200, "v={v}");
+    let content = chat_content(&v);
+    assert!(
+        content.contains("ack opencode/glm-5.3-flash-free: PONG"),
+        "la réponse doit être servie: {content}"
+    );
+    assert!(
+        !content.contains("SECRETLOG"),
+        "le journal des outils a fuité au client: {content}"
+    );
+    assert!(
+        !content.contains("tool_use"),
+        "le journal des outils a fuité au client: {content}"
+    );
+}
+
+/// Même régression sur le flux SSE (c'est le chemin réel d'Hermes
+/// desktop : `stream: true`).
+#[test]
+fn e2e_journal_des_outils_ne_fuit_pas_en_sse() {
+    let i = start("toollogsse", |_| {});
+    let body = serde_json::json!({
+        "model": "glm-5.3-flash-free",
+        "stream": true,
+        "messages": [{"role": "user", "content": "TOOLLOG PONG"}]
+    });
+    let (code, raw) = req(
+        i.port,
+        "POST",
+        "/v1/chat/completions",
+        body.to_string().as_bytes(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(code, 200, "{raw}");
+    assert!(
+        raw.contains("ack opencode/glm-5.3-flash-free: PONG"),
+        "{raw}"
+    );
+    assert!(
+        !raw.contains("SECRETLOG"),
+        "le journal des outils a fuité dans le flux SSE: {raw}"
+    );
+}
+
 #[test]
 fn e2e_robin_smart_exploite_le_rapide_et_explorre() {
     let i = start("robin", |_| {});
     // Robin INTELLIGENT : au boot tout est vierge (médiane 10 s pour tous)
-    // → l'exploitation prend le premier de la cascade (beam) ; l'exploration
-    // 1/5 fait découvrir les autres. Sur 8 requêtes (~1-2 explorations) :
-    // beam domine, et AU MOINS 1 autre modèle a servi (exploration).
+    // → l'exploitation prend le premier de la cascade ; l'exploration
+    // 1/5 fait découvrir les autres. Sur N requêtes (~1-2 explorations) :
+    // le premier domine, et AU MOINS 1 autre modèle a servi
+    // (exploration). Les noms viennent de FREE_MODELS (rotation
+    // vivante) : le test ne code en dur AUCUN nom de modèle.
     let n = FREE_MODELS.len() + 4;
     let mut served: Vec<String> = Vec::new();
     for k in 0..n {
@@ -305,11 +366,12 @@ fn e2e_robin_smart_exploite_le_rapide_et_explorre() {
                 .to_string(),
         );
     }
-    let beam_wins = served.iter().filter(|m| m.ends_with("beam-free")).count();
-    let others = served.iter().filter(|m| !m.ends_with("beam-free")).count();
+    let first = FREE_MODELS[0];
+    let first_wins = served.iter().filter(|m| m.ends_with(first)).count();
+    let others = served.iter().filter(|m| !m.ends_with(first)).count();
     assert!(
-        beam_wins >= 4,
-        "l'exploitation doit dominer (beam, premier jamais vu): {served:?}"
+        first_wins >= 4,
+        "l'exploitation doit dominer ({first}, premier jamais vu): {served:?}"
     );
     assert!(
         others >= 1,
@@ -338,10 +400,12 @@ fn e2e_cascade_fallback_sur_quota() {
         .and_then(|r| r.split(": ").next())
         .unwrap_or_default();
     assert!(
-        fallback.ends_with("beam-free")
-            || fallback.ends_with("longcat-2.5-preview-free")
-            || fallback.ends_with("deepseek-v4.1-flash-free"),
+        fallback != "glm-5.3-flash-free",
         "repondu par un modele de fallback, pas glm: '{served}'"
+    );
+    assert!(
+        FREE_MODELS.iter().any(|m| fallback.ends_with(m)),
+        "repondu par un modele de la frontiere: '{served}'"
     );
     // le refus quota a bien mis glm en cooldown (health)
     let stats = get_json(i.port, "/admin/stats");
@@ -355,33 +419,25 @@ fn e2e_cascade_fallback_sur_quota() {
 
 #[test]
 fn e2e_tous_en_cooldown_429() {
-    // STUB_FAIL = les 6 modèles → chaque tentative échoue en exhaustion,
-    // la chaîne entière brûle → 502 ; puis tout est en cooldown → 429.
+    // STUB_FAIL = TOUS les modèles de la rotation → chaque tentative
+    // échoue en exhaustion, la chaîne entière brûle → 502 ; puis tout
+    // est en cooldown → 429. La liste vient de FREE_MODELS (rotation
+    // vivante) : le test ne code en dur AUCUN nom de modèle.
+    let all_fail = FREE_MODELS.join(",");
     let i = start("cooldown-all", |c| {
-        c.backend_env = vec![(
-            "STUB_FAIL".into(),
-            "beam-free,glm-5.3-flash-free,nemotron-3.5-lightning-free,longcat-2.5-preview-free,mimo-v2.6-flash-free,minimax-m3.1-flash-free,deepseek-v4.1-flash-free".into(),
-        )];
+        c.backend_env = vec![("STUB_FAIL".into(), all_fail)];
     });
     let (code1, v1) = chat(i.port, "glm-5.3-flash-free", "PONG one").unwrap();
     assert_eq!(code1, 502, "toute la chaîne échoue: {v1}");
     let stats = get_json(i.port, "/admin/stats");
-    for m in [
-        "beam-free",
-        "glm-5.3-flash-free",
-        "nemotron-3.5-lightning-free",
-        "longcat-2.5-preview-free",
-        "mimo-v2.6-flash-free",
-        "minimax-m3.1-flash-free",
-        "deepseek-v4.1-flash-free",
-    ] {
+    for m in FREE_MODELS {
         assert!(
             stats["health"][m]["cooldown_secs"].as_u64().unwrap_or(0) > 0,
             "{m} doit être en cooldown: {stats}"
         );
     }
     // requête suivante : tous en cooldown → 429 sans même spawn le stub
-    let (code2, v2) = chat(i.port, "longcat-2.5-preview-free", "PONG two").unwrap();
+    let (code2, v2) = chat(i.port, "glm-5.3-flash-free", "PONG two").unwrap();
     assert_eq!(code2, 429, "attendu 429 tous-cooldowns: {v2}");
     let msg = v2["error"]["message"].as_str().unwrap_or_default();
     assert!(msg.contains("cooldown"), "msg={msg}");
@@ -449,6 +505,33 @@ fn e2e_backend_timeout_devient_502_ou_fallback() {
     assert!(
         stats["stats"]["errors_total"].as_u64().unwrap_or(0) >= 1,
         "le timeout doit être compté: {stats}"
+    );
+}
+
+/// RÉGRESSION « service muet » : sans DEADLINE GLOBALE, une cascade de
+/// 7 modèles × timeout = 7 × 1,5 s de silence, et le client desktop
+/// abandonnait son tour (« ça ne répond pas »). La cascade doit
+/// s'arrêter et rendre une erreur LISIBLE au client.
+#[test]
+fn e2e_deadline_globale_coupe_la_cascade() {
+    // call_timeout 1,5 s → budget global texte = 1,5 × 3 = 4,5 s.
+    // Tous les modèles sont lents (SLOW 5000) : la cascade doit
+    // s'interrompre AVANT d'épuiser les 7 modèles et répondre 502.
+    let i = start("deadline", |_| {});
+    let t0 = std::time::Instant::now();
+    let (code, v) = chat(i.port, "glm-5.3-flash-free", "SLOW 5000").unwrap();
+    let elapsed = t0.elapsed();
+    assert_eq!(code, 502, "la cascade doit finir en 502: {v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("delai global"),
+        "le message doit nommer la deadline: {v}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "la cascade ne doit pas depasser le budget global ({elapsed:?})"
     );
 }
 
