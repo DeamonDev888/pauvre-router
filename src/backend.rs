@@ -238,7 +238,7 @@ fn call_at_inner(
                         }
                         combined.push_str(strip_ansi(&err).trim());
                     }
-                    let text = strip_banner(&combined);
+                    let text = strip_banner(&strip_banner_lines(&combined));
                     if text.is_empty() {
                         // succès SANS texte : diagnostic (bannière seule ?
                         // stdout vide ?) — vu en prod le 21 oct, réponse
@@ -308,6 +308,25 @@ pub fn strip_banner(out: &str) -> String {
         }
     }
     s
+}
+
+/// Retire TOUTES les lignes-bannières de la forme `> build · <modèle>` /
+/// `> plan · <modèle>` — depuis la fusion stdout+stderr, la bannière
+/// (stderr) n'est plus forcément EN TÊTE de la transcription : elle peut
+/// traîner à la fin d'une réponse sinon (vu en prod : « ROUTEUR-OK
+/// \n\n> plan · beam-free »).
+pub fn strip_banner_lines(out: &str) -> String {
+    let kept: Vec<&str> = out
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            let banner = (t.starts_with("> build · ") || t.starts_with("> plan · "))
+                // il faut un nom de modèle derrière le « · »
+                && t.split(" · ").nth(1).map(|m| !m.trim().is_empty()).unwrap_or(false);
+            !banner
+        })
+        .collect();
+    kept.join("\n")
 }
 
 #[cfg(test)]

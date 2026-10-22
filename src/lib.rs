@@ -15,6 +15,7 @@ pub mod classify;
 pub mod guard;
 pub mod http;
 pub mod keystore;
+pub mod logbuf;
 pub mod models;
 pub mod prompt;
 pub mod server;

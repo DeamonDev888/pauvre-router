@@ -156,6 +156,8 @@ pub struct Shared {
     /// pour router les demandes auto-référentielles (« audit du pauvre
     /// router ») vers le VRAI repo au lieu du cwd du client.
     pub self_repo: Option<String>,
+    /// Buffer mémoire des lignes de log (exposé via GET /admin/logs).
+    pub log_buf: Mutex<crate::logbuf::LogBuffer>,
 }
 
 impl Shared {
@@ -181,8 +183,20 @@ impl Shared {
             antiban: crate::antiban::AntiBan::new(cfg.antiban_budget),
             admin_token: cfg.admin_token.clone(),
             self_repo: discover_self_repo(),
+            log_buf: Mutex::new(crate::logbuf::LogBuffer::default()),
         }
     }
+}
+
+/// Écrit une ligne dans stderr ET dans le buffer mémoire (/admin/logs).
+macro_rules! slog {
+    ($shared:expr, $($arg:tt)*) => {{
+        let line = format!($($arg)*);
+        eprintln!("{line}");
+        if let Ok(mut b) = $shared.log_buf.lock() {
+            b.push(&line);
+        }
+    }};
 }
 
 /// Remonte depuis current_exe (…/pauvre-router/target/release/…) vers un
@@ -589,6 +603,24 @@ fn route_request(
     }
     if req.method == "GET" && (path == "/admin/stats" || path == "/admin/health") {
         admin_stats(conn, shared, keep);
+        return;
+    }
+    // ---- logs du service (queue du buffer mémoire) ----
+    if req.method == "GET" && path == "/admin/logs" {
+        let tail: usize = req
+            .header("x-tail")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let lines = shared.log_buf.lock().unwrap().tail(tail);
+        let body = serde_json::json!({ "lines": lines, "tail": tail });
+        let _ = conn.write_response(
+            200,
+            "OK",
+            "application/json",
+            body.to_string().as_bytes(),
+            &[],
+            keep,
+        );
         return;
     }
     // ---- mise à jour ----
@@ -1380,7 +1412,8 @@ fn handle_chat(
                         .entry(model.clone())
                         .or_default()
                         .note_failure(kind, now);
-                    eprintln!(
+                    slog!(
+                        shared,
                         "[pauvre-router] model={model} key={} kind={} cd={}s raw={}",
                         if api_key.is_some() { "pool" } else { "anon" },
                         kind.label(),

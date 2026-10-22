@@ -3,6 +3,23 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.8.8] — 2026-10-22
+
+### Corrigé
+- **Bannière qui fuyait dans les réponses** : depuis la fusion
+  stdout+stderr (v0.8.3), la bannière `> plan · <modèle>` (stderr) n'est
+  plus en tête de la transcription — `strip_banner` la rate et elle
+  s'ajoutait À LA FIN des réponses (« ROUTEUR-OK\n\n> plan · beam-free »).
+  Nouveau `strip_banner_lines` : filtre TOUTES les lignes-bannières
+  `> build|plan · <modèle>` où qu'elles soient.
+
+### Ajouté
+- **`GET /admin/logs?x-tail=N`** : queue du buffer mémoire de logs
+  (500 lignes max, tronquées à 500 chars) — l'agent backend peut se
+  diagnostiquer SANS accès disque (il cherchait le fichier de log hors
+  de sa sandbox et prenait un 404). Les erreurs backend (`model=…
+  kind=… cd=…`) alimentent le buffer en plus de stderr.
+
 ## [0.8.7] — 2026-10-21
 
 (publiée avec les changements 0.8.6 ci-dessous, trouvés par l'auto-audit
