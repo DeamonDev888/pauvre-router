@@ -25,6 +25,25 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 ///   `beam-free` était rapide mais instable en cas de pic, et
 ///   `nemotron-3.5-super-vl-free` très lent (6-42 s)).
 ///
+/// ## `minimax-m3.1-flash-free` : en BOUT DE CHAÎNE (opérateur)
+///
+/// L'opérateur l'a demandé explicitement le 22 oct 2026. Il est
+/// actuellement **NON FONCTIONNEL côté gateway Zen** : « UnknownError /
+/// Unexpected server error » en 2,5 s, de façon CONSTANTE (0/8
+/// réussite), dans TOUTES les configurations (plan/build, avec/sans
+/// `--dir`). Toute la famille MiniMax est touchée : `minimax-m3`,
+/// `minimax-m2.7`, `minimax-m2.5`, `minimax-m3.1-flash-free`,
+/// `minimax-m3.1-flash`, `minimax-m3-flash-free`, `minimax-m3.1-free`.
+///
+/// Il est malgré tout mis en BOUT de chaîne : la cascade l'essaie et
+/// bascule sur un modèle sain s'il échoue (cooldown court de 10 s),
+/// donc il ne coûte qu'une tentative de 2,5 s. Le jour où la gateway
+/// le rétablit, il est de nouveau servi SANS modifier le code.
+///
+/// Historique : le 21 oct, ce modèle répondait (6 ok / 7 erreurs dans
+/// les stats persistées) — c'est bien la gateway qui l'a cassé, pas le
+/// routeur.
+///
 /// ## Piège de diagnostic : un timeout n'est PAS une mort
 ///
 /// Un premier passage a classé `beam-free` et
@@ -54,6 +73,9 @@ pub const FREE_MODELS: &[&str] = &[
     "mimo-v2.6-flash-free",
     "nemotron-3.5-lightning-free",
     "big-pickle",
+    // demandé par l'opérateur : actuellement HS côté gateway Zen, mais
+    // réactivé automatiquement dès que la gateway le rétablit.
+    "minimax-m3.1-flash-free",
 ];
 
 /// Pseudo-modèle exposé aux clients : round-robin permanent sur les
@@ -609,5 +631,36 @@ mod tests {
         assert_eq!(c[0], "modele-mort-hors-rotation");
         assert_eq!(c.len(), FREE_MODELS.len() + 1);
         assert!(c.iter().any(|m| m == FREE_MODELS[0]), "repli disponible");
+    }
+
+    /// CONTRAT DE RÉSILIENCE : un modèle actuellement HS (erreur
+    /// gateway) doit être en BOUT de chaîne — jamais en tête. S'il
+    /// était en tête, chaque requête paierait son timeout (2,5 s ici,
+    /// 150 s en mode agent) avant de basculer.
+    #[test]
+    fn modeles_connus_hs_sont_en_fin_de_chaine() {
+        // modèles dont l'échec est AVÉRÉ (gateway Zen) : ils doivent
+        // être les derniers de la chaîne.
+        let hs: &[&str] = &["minimax-m3.1-flash-free"];
+        for m in hs {
+            let pos = FREE_MODELS
+                .iter()
+                .position(|x| x == m)
+                .unwrap_or_else(|| panic!("{m} doit etre dans la chaine"));
+            assert!(
+                pos >= FREE_MODELS.len() - hs.len(),
+                "{m} (HS) doit etre en fin de chaine, pas a la position {pos}: {FREE_MODELS:?}"
+            );
+        }
+    }
+
+    /// Le 1er modèle de la chaîne ne doit JAMAIS être un modèle dont
+    /// l'échec est connu : c'est lui qui sert chaque requête.
+    #[test]
+    fn tete_de_chaine_sans_modele_hs() {
+        assert_eq!(
+            FREE_MODELS[0], "glm-5.3-flash-free",
+            "la tete de chaine doit rester le modele le plus fiable"
+        );
     }
 }

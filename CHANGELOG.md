@@ -3,6 +3,30 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.9.2] — 2026-10-22
+
+### Modèles
+- **`minimax-m3.1-flash-free` réintégré en bout de chaîne** à la
+  demande de l'opérateur.
+  Il est actuellement **NON FONCTIONNEL côté gateway Zen** : «
+  UnknownError / Unexpected server error » en 2,5 s, de façon
+  **constante** (0/8 réussite), dans toutes les configurations
+  (plan/build, avec/sans `--dir`). Toute la famille MiniMax est
+  touchée (`minimax-m3`, `minimax-m2.7`, `minimax-m2.5`,
+  `minimax-m3.1-flash`, `minimax-m3-flash-free`, `minimax-m3.1-free`).
+  Historique : le 21 oct il répondait (6 ok / 7 erreurs dans les stats
+  persistées) → c'est la gateway qui l'a cassé, pas le routeur.
+  Il est placé **en dernier** : la cascade l'essaie, prend son cooldown
+  court de 10 s et bascule sur un modèle sain — il ne coûte qu'une
+  tentative de 2,5 s, et il sera de nouveau servi **sans modifier le
+  code** le jour où la gateway le rétablit.
+
+### Testé
+- 2 nouveaux tests unitaires (100 unitaires, 137 au total) :
+  `modeles_connus_hs_sont_en_fin_de_chaine` (un modèle HS ne doit
+  JAMAIS être en tête de chaîne : chaque requête paierait son
+  timeout) et `tete_de_chaine_sans_modele_hs`.
+
 ## [0.9.1] — 2026-10-22
 
 ### Corrigé
