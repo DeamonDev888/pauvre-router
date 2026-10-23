@@ -100,12 +100,12 @@ fn call_at_passe_la_cle_api_au_spawn() {
 fn call_at_env_additionnelle_positionnee() {
     let env = vec![(
         "STUB_FAIL".to_string(),
-        "longcat-2.5-preview-free".to_string(),
+        "modele-qui-echoue-free".to_string(),
     )];
     // le modèle visé est dans la liste → échec ; un autre → OK
     let err = call_at(
         stub(),
-        "longcat-2.5-preview-free",
+        "modele-qui-echoue-free",
         "x",
         Duration::from_secs(10),
         None,
@@ -117,7 +117,7 @@ fn call_at_env_additionnelle_positionnee() {
     assert!(matches!(err, BackendError::Failed { .. }));
     let ok = call_at(
         stub(),
-        "deepseek-v4.1-flash-free",
+        "modele-hors-liste-free",
         "x",
         Duration::from_secs(10),
         None,
@@ -126,7 +126,7 @@ fn call_at_env_additionnelle_positionnee() {
         None,
     )
     .expect("le modèle hors liste doit passer");
-    assert_eq!(ok.text, "ack opencode/deepseek-v4.1-flash-free: x");
+    assert_eq!(ok.text, "ack opencode/modele-hors-liste-free: x");
 }
 
 #[test]

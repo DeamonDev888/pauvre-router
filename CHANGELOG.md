@@ -43,14 +43,26 @@ Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — s�
   d'explorations et saute le modèle d'exploitation.
 
 ### Modèles
-- Rotation du 22 oct 2026 (test de liveness réel sur chaque modèle) :
-  `longcat-2.5-preview-free`, `minimax-m3.1-flash-free`,
-  `flint-40b-free` et `jev-1.13-free` sont **morts** (erreur gateway
-  « Unexpected server error » / « Endpoint is unavailable ») ;
-  `beam-free` est **instable** (timeout récurrent > 90 s).
-  Nouvelle chaîne : `big-pickle` → `glm-5.3-flash-free` →
-  `nemotron-3.5-lightning-free` → `mimo-v2.6-flash-free` →
-  `deepseek-v4.1-flash-free`.
+- Rotation du 22 oct 2026 (test de liveness réel, **plusieurs passes**
+  sur chaque modèle) : `longcat-2.5-preview-free`,
+  `minimax-m3.1-flash-free`, `flint-40b-free` et `jev-1.13-free` sont
+  **morts** (erreur gateway « Unexpected server error » / « Endpoint is
+  unavailable »).
+- **Retraits demandés par l'opérateur** : `beam-free` et
+  `nemotron-3.5-super-vl-free` sortent de la chaîne (le second était
+  très lent : 6-42 s).
+- **Piège de diagnostic** : un TIMEOUT isolé ne prouve PAS qu'un
+  modèle est mort. Un premier passage avait classé `beam-free` et
+  `nemotron-3.5-super-vl-free` comme morts sur un timeout de 90 s du
+  harness — re-testés 3 fois (texte + agent), ils répondaient tous les
+  deux (`beam-free` en 4 s stable). Confirmer par plusieurs passes
+  avant de retirer un modèle de la chaîne.
+- Chaîne finale : `glm-5.3-flash-free` → `deepseek-v4.1-flash-free` →
+  `mimo-v2.6-flash-free` → `nemotron-3.5-lightning-free` →
+  `big-pickle`.
+- **Aucun test ne code plus en dur un nom de modèle** : tous dérivent
+  la liste de `FREE_MODELS` (la rotation les cassait à chaque
+  changement).
 
 ### Testé
 - Les tests E2E ne codent plus **en dur** de noms de modèles (la

@@ -259,8 +259,11 @@ fn e2e_chat_json_puis_cache_hit() {
 #[test]
 fn e2e_chat_sse_stream() {
     let i = start("sse", |_| {});
+    // Modèle pris dans la rotation VIVANTE : le test ne doit pas coder
+    // en dur un nom de modèle (la rotation le casserait).
+    let model = FREE_MODELS[1];
     let body = serde_json::json!({
-        "model": "longcat-2.5-preview-free",
+        "model": model,
         "stream": true,
         "messages": [{"role": "user", "content": "PONG"}]
     });
@@ -286,7 +289,7 @@ fn e2e_chat_sse_stream() {
     assert!(raw.contains("data: [DONE]"));
     // le contenu est arrivé dans un delta
     assert!(
-        raw.contains("\"content\":\"ack opencode/longcat-2.5-preview-free: PONG\""),
+        raw.contains(&format!("\"content\":\"ack opencode/{model}: PONG\"")),
         "{raw}"
     );
 }
@@ -489,16 +492,18 @@ fn e2e_antispam_429_puis_requete_normale_ok() {
 fn e2e_backend_timeout_devient_502_ou_fallback() {
     // SLOW 5000 > call_timeout (1.5s) : le modèle visé timeout → soit un
     // fallback sert la requête, soit 502 si toute la chaîne brûle.
+    // Modèle tiré de la rotation VIVANTE (pas de nom en dur).
+    let target = FREE_MODELS[1];
     let i = start("timeout", |c| {
-        c.backend_env = vec![("STUB_FAIL".into(), "longcat-2.5-preview-free".into())];
+        c.backend_env = vec![("STUB_FAIL".into(), target.into())];
     });
-    let (code, v) = chat(i.port, "longcat-2.5-preview-free", "SLOW 5000").unwrap();
+    let (code, v) = chat(i.port, target, "SLOW 5000").unwrap();
     assert!(code == 200 || code == 502, "code inattendu {code}: {v}");
     if code == 200 {
         let served = chat_content(&v);
         assert!(
-            !served.contains("longcat-2.5-preview-free"),
-            "space-bunny doit être en cooldown, pas servir: {served}"
+            !served.contains(target),
+            "le modèle en cooldown ne doit pas servir: {served}"
         );
     }
     let stats = get_json(i.port, "/admin/stats");
@@ -793,11 +798,12 @@ fn e2e_update_endpoints() {
 #[test]
 fn e2e_requetes_concurrentes_toutes_servies() {
     let i = start("concurrent", |_| {});
+    let model = FREE_MODELS[0];
     let mut handles = Vec::new();
     for n in 0..12 {
         let port = i.port;
         handles.push(std::thread::spawn(move || {
-            chat(port, "longcat-2.5-preview-free", &format!("PONG c{n}")).unwrap()
+            chat(port, model, &format!("PONG c{n}")).unwrap()
         }));
     }
     let mut oks = 0;
@@ -879,7 +885,8 @@ fn e2e_body_trop_grand_413_propre_sans_rst() {
     let i = start("body413", |_| {});
     let big = vec![b'a'; 9_000_000]; // 9 Mo > 8 Mo
     let body = format!(
-        "{{\"model\":\"beam-free\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}]}}",
+        "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}]}}",
+        FREE_MODELS[0],
         String::from_utf8_lossy(&big)
     );
     // lecture brute : un RST remontrait comme erreur io, pas comme status
@@ -916,7 +923,7 @@ fn e2e_body_lourd_848_messages_passe() {
         })
         .collect();
     let body = serde_json::json!({
-        "model": "beam-free",
+        "model": FREE_MODELS[0],
         "messages": messages,
     });
     let raw = body.to_string();
@@ -953,7 +960,7 @@ fn e2e_antiban_budget_serre_bloque_sans_spawner() {
     let mut ok = 0;
     let mut blocked = 0;
     for n in 1..=8 {
-        let (c, v) = chat(i.port, "beam-free", &format!("PONG budget {n}")).unwrap();
+        let (c, v) = chat(i.port, FREE_MODELS[0], &format!("PONG budget {n}")).unwrap();
         match c {
             200 => ok += 1,
             429 => {
@@ -990,7 +997,7 @@ fn e2e_antiban_budget_serre_bloque_sans_spawner() {
     )
     .unwrap();
     assert_eq!(code, 200, "{b}");
-    let (c9, v9) = chat(i.port, "beam-free", "PONG budget neuf").unwrap();
+    let (c9, v9) = chat(i.port, FREE_MODELS[0], "PONG budget neuf").unwrap();
     assert_eq!(c9, 200, "budget relevé → repasse: {v9}");
 }
 

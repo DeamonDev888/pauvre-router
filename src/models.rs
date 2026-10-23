@@ -13,30 +13,41 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 /// Modèles frontière retenus (les meilleurs gratuits testés en live).
 ///
 /// Rotation du 22 oct 2026 (test de liveness réel, `opencode run
-/// --format json` sur chaque modèle) :
+/// --format json` sur chaque modèle, plusieurs passes) :
 /// - `longcat-2.5-preview-free` : **MORT** — « UnknownError /
 ///   Unexpected server error » (gateway) ;
 /// - `minimax-m3.1-flash-free` : **MORT** — même erreur gateway ;
 /// - `flint-40b-free` : **MORT** — « Upstream request failed: Endpoint
 ///   is unavailable » (503) ;
 /// - `jev-1.13-free` : **MORT** — même erreur gateway ;
-/// - `beam-free` : **instable** — timeout récurrent (> 90 s).
+/// - `beam-free` et `nemotron-3.5-super-vl-free` : **retirés à la
+///   demande de l'opérateur** le 22 oct 2026 (choix de l'opérateur :
+///   `beam-free` était rapide mais instable en cas de pic, et
+///   `nemotron-3.5-super-vl-free` très lent (6-42 s)).
 ///
-/// Remplacés par `big-pickle` (rapide en texte) et
-/// `nemotron-3.5-lightning-free`.
+/// ## Piège de diagnostic : un timeout n'est PAS une mort
+///
+/// Un premier passage a classé `beam-free` et
+/// `nemotron-3.5-super-vl-free` comme « morts » sur un TIMEOUT de 90 s
+/// du harness de test. Re-testés en conditions réelles (agent + texte,
+/// 3 passes) ils répondaient TOUS LES DEUX : `beam-free` en 4 s stable,
+/// `nemotron-3.5-super-vl-free` en 6-42 s (latence variable mais
+/// fiable). Conclusion : un timeout isolé ≠ modèle mort. Il faut
+/// CONFIRMER par plusieurs passes avant de retirer un modèle de la
+/// chaîne — sinon on réduit la redondance pour rien.
 ///
 /// ## Ordre de la chaîne = ordre de FIABILITÉ
 ///
 /// Le 1er modèle est celui qui sert le mieux, parce qu'un modèle qui
-/// HANG en mode agent brûle tout son timeout (240 s) avant que la
+/// HANG en mode agent brûle tout son timeout (150 s) avant que la
 /// cascade passe au suivant — le client desktop attend alors 4-6 min
 /// pour une tâche de 10 s. Observé : `big-pickle` a hang 240 s puis
 /// `glm-5.3-flash-free` a répondu en 119 s → 359 s pour l'utilisateur.
 ///
 /// Ordre mesuré en prod (latence + taux d'échec) :
-/// `glm-5.3-flash-free` (6 ok / 0 ko, ~6 s) en tête, puis les autres
-/// par fiabilité décroissante. `big-pickle` est rapide en texte mais
-/// instable en agent → il passe en fin de chaîne.
+/// `glm-5.3-flash-free` (0 ko, ~5 s) en tête, puis les autres par
+/// fiabilité décroissante. `big-pickle` est correct mais instable en
+/// agent → il passe en fin de chaîne.
 pub const FREE_MODELS: &[&str] = &[
     "glm-5.3-flash-free",
     "deepseek-v4.1-flash-free",
