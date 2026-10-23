@@ -545,4 +545,69 @@ mod tests {
         let cd = h.note_failure(ErrorKind::ModelInvalid, now);
         assert_eq!(cd, COOLDOWN_MODEL_INVALID);
     }
+
+    /// CONTRAT de la rotation : la chaîne doit rester saine. Un nom
+    /// vide, dupliqué ou contenant un caractère interdit casserait le
+    /// spawn (`--model opencode/<nom>`) ou la cascade.
+    #[test]
+    fn chaine_saine_sans_doublon_ni_caractere_interdit() {
+        let mut seen = std::collections::HashSet::new();
+        for m in FREE_MODELS {
+            assert!(!m.is_empty(), "nom de modele vide");
+            assert!(
+                m.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_'),
+                "nom invalide (caractere interdit): {m}"
+            );
+            assert!(m.len() <= 80, "nom trop long pour sanitize_model: {m}");
+            assert!(seen.insert(*m), "modele duplique dans la chaine: {m}");
+        }
+        assert!(
+            FREE_MODELS.len() >= 3,
+            "il faut de la redondance : {} modeles",
+            FREE_MODELS.len()
+        );
+    }
+
+    /// Le pseudo-modèle robin ne doit JAMAIS être dans la chaîne
+    /// (sinon la cascade s'auto-récupère à l'infini).
+    #[test]
+    fn robin_absent_de_la_chaine_reelle() {
+        assert!(
+            !FREE_MODELS.contains(&ROBIN_MODEL),
+            "{ROBIN_MODEL} ne doit pas etre un modele reel"
+        );
+    }
+
+    /// Le 1er modèle de la chaîne est le plus prioritaire : c'est lui
+    /// qui sert en premier (ordre de fiabilité). La cascade doit donc
+    /// commencer par LUI quand il est demandé explicitement.
+    #[test]
+    fn cascade_commence_par_le_modele_demande_puis_les_frontieres() {
+        let first = FREE_MODELS[0];
+        let c = cascade(first);
+        assert_eq!(c[0], first, "le modele demande passe en tete");
+        // tous les autres modeles de la chaine sont derriere
+        for m in FREE_MODELS.iter().skip(1) {
+            let pos = c
+                .iter()
+                .position(|x| x == m)
+                .expect("present dans la cascade");
+            assert!(pos > 0, "{m} doit etre apres le modele demande");
+        }
+        assert_eq!(c.len(), FREE_MODELS.len(), "pas de doublon");
+    }
+
+    /// Un modèle demandé HORS rotation (ex. un nom mort) doit quand
+    /// même être servi : il est en tête de la cascade, et les modèles
+    /// de la rotation servent de repli. C'est ce chemin qui a permit
+    /// de servir `longcat-2.5-preview-free` après son retrait de la
+    /// rotation (le client pouvait encore le demander).
+    #[test]
+    fn modele_hors_rotation_reste_servi_avec_repli() {
+        let c = cascade("modele-mort-hors-rotation");
+        assert_eq!(c[0], "modele-mort-hors-rotation");
+        assert_eq!(c.len(), FREE_MODELS.len() + 1);
+        assert!(c.iter().any(|m| m == FREE_MODELS[0]), "repli disponible");
+    }
 }

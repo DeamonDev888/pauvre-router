@@ -2,3 +2,12 @@
 *.log
 *.out
 state.json
+# État local du service : compteurs de santé des modèles + stats.
+# Ne doit JAMAIS être commité (c'est de la donnée d'exécution, pas du code).
+.pauvre-router-state.json
+# Secrets : le pool de clés API est dans le HOME de l'utilisateur.
+.pauvre-router-keys.json
+*.keys.json
+# Fichiers d'environnement (contiennent des API keys).
+.env
+.env.*

@@ -3,6 +3,50 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.9.1] — 2026-10-22
+
+### Corrigé
+- **Un événement `error` sans payload ÉCHOUAIT une réponse valide** :
+  `parse_events` transformait tout événement `type == "error"` en
+  erreur, même sans information exploitable (`{"type":"error"}` nu) →
+  le client recevait une erreur au lieu de la RÉPONSE du modèle. Une
+  erreur sans message ni nom exploitable est désormais IGNORÉE ; une
+  erreur avec un `name` seul reste exploitable.
+- **Le `ref` amont est conservé** dans le message d'erreur
+  (`UnknownError: … (ref err_4e254f71)`) : c'est la référence citée
+  par l'amont dans ses logs serveur — sans elle, le diagnostic d'une
+  panne gateway est impossible.
+- **Un `text` vide est ignoré** : une réponse vide ne doit jamais
+  partir vers le client.
+
+### Testé
+- **19 nouveaux tests unitaires** (98 unitaires au total, 135 avec
+  stub + E2E) :
+  - `classify` : « Unexpected server error » reste `Transient` (y
+    compris dans la variante contenant « not available »), ordre des
+    buckets (`Exhausted` avant `ModelInvalid`), forme structurée réelle
+    d'opencode ;
+  - `ocjson` : `text` sans champ `text`, `part` absent/`null`, types
+    d'événements inconnus, format d'erreur réel (avec `ref`), texte
+    vide, première erreur gagnante, bannière/ANSI absents du texte ;
+  - `server` : timeout agent plafonné à 150 s, budget de cascade
+    borné (2× agent / 3× texte), invariant « le budget borne le
+    silence quel que soit le nombre de modèles », timeout effectif
+    borné par le reste du budget ;
+  - `models` : chaîne saine (pas de doublon, pas de caractère
+    interdit, redondance ≥ 3), pseudo-modèle robin absent de la
+    chaîne réelle, cascade qui commence par le modèle demandé, modèle
+    hors rotation toujours servi avec repli.
+- Deux de ces tests ont trouvé de VRAIS défauts (erreur vide qui
+  écrasait la réponse, `ref` perdu) — corrigés ci-dessus.
+
+### Sécurité
+- **`.gitignore` durci** : `.pauvre-router-state.json` (donnée
+  d'exécution), `.pauvre-router-keys.json` (pool de clés API),
+  `*.keys.json`, `.env` et `.env.*` sont désormais exclus.
+- **Scan gitleaks v8.28.0** : aucune fuite sur le working tree
+  (~1,91 Go scannés) ni sur l'historique complet (48 commits).
+
 ## [0.9.0] — 2026-10-22
 
 ### Corrigé

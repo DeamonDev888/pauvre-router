@@ -144,6 +144,55 @@ mod tests {
         assert_eq!(classify("unknown model: toto"), ErrorKind::ModelInvalid);
     }
 
+    /// RÉGRESSION v0.9.0 : « Unexpected server error » est une panne
+    /// GÉNÉRIQUE de la gateway, PAS un modèle inconnu. Le message
+    /// contient « not available » dans certaines variantes → sans test
+    /// explicite AVANT le bucket « invalid », un modèle VALIDE était
+    /// cloué `COOLDOWN_MODEL_INVALID` (3600 s) sur un hiccup.
+    #[test]
+    fn unexpected_server_error_est_transient_pas_model_invalide() {
+        let raw = "UnknownError: Unexpected server error. Check server logs for details.";
+        assert_eq!(classify(raw), ErrorKind::Transient);
+        // variante qui contient « not available » : ne doit PAS basculer
+        // en ModelInvalid
+        let variante = "UnknownError: Unexpected server error. Model not available right now.";
+        assert_eq!(classify(variante), ErrorKind::Transient);
+        // et un VRAI modèle inconnu reste ModelInvalid
+        assert_eq!(classify("unknown model: toto"), ErrorKind::ModelInvalid);
+        assert_eq!(
+            classify("model not available on this account"),
+            ErrorKind::ModelInvalid
+        );
+    }
+
+    /// L'ordre des buckets est structurant : « exhausted » doit gagner
+    /// contre « invalid », sinon un quota épuisé cloue un modèle 1 h
+    /// au lieu de 2 min.
+    #[test]
+    fn ordre_des_buckets_exhausted_puis_invalid() {
+        // contient 429 ET "unknown model" → Exhausted (quota d'abord)
+        assert_eq!(
+            classify("429 unknown model quota exceeded"),
+            ErrorKind::Exhausted
+        );
+        // le flag IP bat TOUT (testé avant l'autre bucket)
+        let flagged = "OpenCode's free models aren't available from your current network because we've detected abusive traffic from this IP address.";
+        assert_eq!(classify(flagged), ErrorKind::IpFlagged);
+    }
+
+    /// La forme d'erreur STRUCTURÉE réellement émise par opencode
+    /// (`--format json`) doit être classée : c'est ce chemin qui
+    /// remplace le transcript brut de 28 Ko.
+    #[test]
+    fn erreur_structuree_opencode_classee() {
+        let raw = "UnknownError: Unexpected server error. Check server logs for details.";
+        assert_eq!(classify(raw), ErrorKind::Transient);
+        let quota = "UsageLimitError: Free usage limit exceeded for glm-5.3-flash-free";
+        assert_eq!(classify(quota), ErrorKind::Exhausted);
+        let auth = "ProviderAuthError: free models aren't available from your current network because we've detected abusive traffic from this IP address.";
+        assert_eq!(classify(auth), ErrorKind::IpFlagged);
+    }
+
     #[test]
     fn transient_par_defaut() {
         assert_eq!(classify("network unreachable"), ErrorKind::Transient);

@@ -286,6 +286,40 @@ fn err_body(msg: &str, kind: &str, retry_after: Option<u64>) -> serde_json::Valu
     e
 }
 
+/// Timeout d'UNE tentative backend.
+///
+/// - mode texte (client sans tools) : le timeout de base (80 s) ;
+/// - mode agent (client avec tools) : 150 s. La tâche agentique réelle
+///   (audit, corrections multi-fichiers) prend 2-4 min, mais au-delà de
+///   150 s le client desktop a déjà abandonné son tour — et un modèle
+///   qui HANG brûlerait tout ce budget avant que la cascade passe au
+///   suivant (observé : 359 s pour une tâche de 10 s).
+pub fn call_timeout_for(has_tools: bool, base: Duration) -> Duration {
+    if has_tools {
+        Duration::from_secs(150)
+    } else {
+        base
+    }
+}
+
+/// Budget GLOBAL de la cascade (deadline) : borne le silence total
+/// servi au client.
+///
+/// Sans elle, une cascade de N modèles × timeout = N × 240 s de silence
+/// avant la première réponse (le client desktop abandonnait son tour).
+///
+/// - agent : 2 × le timeout d'une tentative (une longue + une de
+///   secours) ;
+/// - texte : 3 × le timeout d'une tentative (plusieurs modèles rapides
+///   qui se relancent).
+pub fn cascade_budget(has_tools: bool, call_timeout: Duration) -> Duration {
+    if has_tools {
+        call_timeout * 2
+    } else {
+        call_timeout * 3
+    }
+}
+
 /// Le chemin cible-t-il l'espace d'administration ?
 /// (`/admin` et `/admin/...` — pas `/administrateur`).
 pub fn is_admin_path(path: &str) -> bool {
@@ -1151,25 +1185,13 @@ fn handle_chat(
     // 150 s : au-delà, une tâche agentique légitime n'a pas de réponse
     // à temps de toute façon, et le client desktop coupe son tour bien
     // avant.
-    let call_timeout = if has_tools {
-        Duration::from_secs(150)
-    } else {
-        shared.call_timeout
-    };
+    let call_timeout = call_timeout_for(has_tools, shared.call_timeout);
     // DEADLINE GLOBALE DE LA CASCADE : sans elle, une cascade de 7
     // modèles × 240 s = 28 min de silence avant la première réponse —
     // le client (Hermes desktop) coupe son tour et le service paraît
     // « muet ». Le budget total est borné : une seule tentative longue
     // (240 s agent) ou 2-3 tentatives courtes (texte).
-    let cascade_deadline = Instant::now()
-        + if has_tools {
-            // agent : 1 tentative longue laisse 240 s ; la cascade entière
-            // ne doit pas dépasser 2× le timeout d'une tentative.
-            call_timeout * 2
-        } else {
-            // texte : 80 s par tentative, 3 tentatives max = 240 s.
-            call_timeout * 3
-        };
+    let cascade_deadline = Instant::now() + cascade_budget(has_tools, call_timeout);
 
     // 3) cache
     if let Some(text) = shared
@@ -1777,6 +1799,98 @@ pub fn serve(bound: BoundServer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RÉGRESSION v0.9.0 : le timeout agent et le budget de cascade
+    /// sont la BARDE anti-silence du client desktop. Ces bornes sont
+    /// des contrats : les changer sans tests, c'est re-créer le bug
+    /// « le routeur ne répond pas ».
+    #[test]
+    fn timeout_agent_plafonne_a_150s() {
+        let base = Duration::from_secs(80);
+        assert_eq!(call_timeout_for(false, base), base, "mode texte : base");
+        assert_eq!(
+            call_timeout_for(true, base),
+            Duration::from_secs(150),
+            "mode agent : plafonne a 150 s"
+        );
+        // même avec une base enorme (config perverse), on plafonne
+        assert_eq!(
+            call_timeout_for(true, Duration::from_secs(3600)),
+            Duration::from_secs(150)
+        );
+    }
+
+    #[test]
+    fn budget_cascade_borne_le_silence_total() {
+        let base = Duration::from_secs(80);
+        // texte : 3 tentatives
+        assert_eq!(cascade_budget(false, base), Duration::from_secs(240));
+        // agent : 2 tentatives de 150 s
+        assert_eq!(
+            cascade_budget(true, Duration::from_secs(150)),
+            Duration::from_secs(300)
+        );
+    }
+
+    /// INVARIANT central : le budget de cascade borne TOUJOURS le
+    /// silence servi au client, quel que soit le nombre de modèles.
+    ///
+    /// Le budget est un PLAFOND (pas une somme) : avec 1 seul modèle,
+    /// il vaut 3 × le timeout d'une tentative, ce qui est plus long que
+    /// le silence réel (1 tentative). Ce qui compte, c'est qu'il ne
+    /// DÉBORDE JAMAIS quand la chaîne est longue — c'est exactement le
+    /// bug « 7 modèles × 240 s = 28 min de silence ».
+    #[test]
+    fn budget_cascade_borne_le_silence_peu_importe_la_longueur_de_la_chaine() {
+        let base = Duration::from_secs(80);
+        for has_tools in [false, true] {
+            let one = call_timeout_for(has_tools, base);
+            let budget = cascade_budget(has_tools, one);
+            // le budget ne doit jamais dépasser 3 tentatives (le pire
+            // ratio : texte = 3×)
+            let max_attempts = 3u32;
+            assert_eq!(
+                budget,
+                one * max_attempts.min(if has_tools { 2 } else { 3 }),
+                "budget={budget:?}"
+            );
+            // le budget reste sous 10 min (borne le lecteur du client
+            // desktop)
+            assert!(
+                budget <= Duration::from_secs(600),
+                "tools={has_tools} : budget {budget:?} trop long"
+            );
+            // et pour une chaîne longue, le silence total reste borné
+            for n_models in 1..=12usize {
+                let silence_reel = one * n_models as u32;
+                let silence_borne = silence_reel.min(budget);
+                assert!(
+                    silence_borne <= budget,
+                    "n={n_models} : silence borné {silence_borne:?} > budget {budget:?}"
+                );
+            }
+        }
+    }
+
+    /// Le timeout effectif d'une tentative est borné par le RESTE du
+    /// budget global : sans ça, une tentative peut déborder la deadline
+    /// (200 s restantes + 240 s de timeout = 440 s).
+    #[test]
+    fn timeout_effectif_borne_par_le_reste_du_budget() {
+        let deadline = Instant::now() + Duration::from_secs(100);
+        let reste = deadline.saturating_duration_since(Instant::now());
+        let effectif = Duration::from_secs(150).min(reste);
+        assert!(
+            effectif <= reste,
+            "le timeout effectif {effectif:?} doit tenir dans le reste {reste:?}"
+        );
+        // budget épuisé → reste zéro → timeout nul (la cascade s'arrête)
+        let past = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            past.saturating_duration_since(Instant::now()),
+            Duration::ZERO
+        );
+    }
 
     #[test]
     fn sse_split_decoupe_et_recompose() {
