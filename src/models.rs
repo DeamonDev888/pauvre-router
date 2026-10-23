@@ -23,7 +23,10 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 /// - `beam-free` et `nemotron-3.5-super-vl-free` : **retirés à la
 ///   demande de l'opérateur** le 22 oct 2026 (choix de l'opérateur :
 ///   `beam-free` était rapide mais instable en cas de pic, et
-///   `nemotron-3.5-super-vl-free` très lent (6-42 s)).
+///   `nemotron-3.5-super-vl-free` très lent (6-42 s)) ;
+/// - `mimo-v2.6-flash-free` et `nemotron-3.5-lightning-free` :
+///   **retirés à la demande de l'opérateur** le 22 oct 2026 (ils
+///   fonctionnaient ; la chaîne garde assez de redondance sans eux).
 ///
 /// ## `minimax-m3.1-flash-free` : en BOUT DE CHAÎNE (opérateur)
 ///
@@ -70,8 +73,6 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 pub const FREE_MODELS: &[&str] = &[
     "glm-5.3-flash-free",
     "deepseek-v4.1-flash-free",
-    "mimo-v2.6-flash-free",
-    "nemotron-3.5-lightning-free",
     "big-pickle",
     // demandé par l'opérateur : actuellement HS côté gateway Zen, mais
     // réactivé automatiquement dès que la gateway le rétablit.

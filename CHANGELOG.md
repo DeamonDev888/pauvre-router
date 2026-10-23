@@ -3,6 +3,16 @@
 Toutes les évolutions notables de **Le Router des Pauvres**.
 Format basé sur [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/) — sémantique [SemVer](https://semver.org/).
 
+## [0.9.3] — 2026-10-22
+
+### Modèles
+- **Retraits demandés par l'opérateur** : `mimo-v2.6-flash-free` et
+  `nemotron-3.5-lightning-free` sortent de la chaîne (ils
+  fonctionnaient tous les deux).
+- Chaîne finale : `glm-5.3-flash-free` → `deepseek-v4.1-flash-free` →
+  `big-pickle` → `minimax-m3.1-flash-free` (ce dernier est encore HS
+  côté gateway Zen, cf. v0.9.2).
+
 ## [0.9.2] — 2026-10-22
 
 ### Modèles
